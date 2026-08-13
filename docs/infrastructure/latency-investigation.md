@@ -212,3 +212,128 @@ both tiers (implemented regardless of variant outcome, as a safety bound —
 see `llm_fallback_service.py`), and the embedding-cross-check skip-when-
 decisive optimization (`llm_confidence_service.py`) — both real,
 unconditional improvements independent of which schema variant "won."
+
+## The G0-G3 experiment: does GPT-5 change the answer?
+
+`logprobs=true` is the current production setting — V4 (drop `logprobs`,
+keep everything else) won on latency in the experiment above but was
+deliberately not adopted, because this service's confidence score is
+built on the completion's logprobs. This round asks a different question:
+is there a model that's both fast *and* reliable enough that dropping
+`logprobs` (which GPT-5 requires, since it rejects `logprobs` requests
+outright) becomes worth it on its own merits?
+
+### Premise re-verified before spending anything
+
+Both re-checked live, not assumed from the first investigation:
+- `gpt-5-nano` and `gpt-5-mini` are still valid, listed model IDs
+  (confirmed via `client.models.list()` — alongside a lot of newer
+  siblings: `gpt-5.1` through `gpt-5.6`, none tested here, out of scope
+  for this round).
+- The `logprobs` 403 still reproduces, byte-identical error message, on
+  both models: `"You are not allowed to request logprobs from this model"`.
+
+Premise holds. Proceeding with all four variants at `logprobs=false`.
+
+### Results
+
+Same 8-query fixed set as the V0-V4 experiment, sequential,
+`max_completion_tokens=300`, validated against the real strict taxonomy
+model regardless of what schema was sent on the wire.
+
+| Variant | Model | strict | Avg latency | Avg completion tokens | Tokens/sec | Validation pass rate |
+|---|---|---|---|---|---|---|
+| G0 (baseline = V4) | gpt-4.1-nano | true | 1,962ms | 190 | **96.7** | 88% (7/8) |
+| G1 | gpt-5-nano | true | 2,932ms (+49%) | 234 | 79.9 (-17%) | 62% (5/8) |
+| G2 | gpt-5-nano | false | 1,628ms | 72 | 44.3 | **0% (0/8)** |
+| G3 | gpt-5-mini | false | 1,343ms | 41 | 30.8 | 50% (4/8) |
+
+**The tokens/sec bet did not pay off — measured, not inferred.** The
+question this round was actually deciding: does GPT-5 generate faster
+per-token than GPT-4.1, which would make its higher sticker latency at
+matched token counts less of a concern? No. GPT-5-nano is **17% *slower*
+in tokens/sec than GPT-4.1-nano** (79.9 vs 96.7), and GPT-5-mini slower
+still (30.8). Whatever GPT-5-nano's `reasoning_effort=minimal` mode is
+spending time on, it isn't generating the visible completion faster.
+
+### G1 (gpt-5-nano, strict mode) — strictly worse, not a trade-off
+
+Slower (+49%), more tokens (234 vs 190 — strict mode's null-padding cost
+applies here too, and apparently more of it), and worse validation (62%
+vs 88%) than the current baseline, simultaneously. Not a latency-vs-
+correctness trade-off to weigh — it loses on every axis measured. One
+observed failure mode worth noting: `מצבי_עסקה` (transaction types) came
+back as `["מכירה","השכרה","שותפים","מגרשים","מגרשים"]` for the query
+"משהו זול" ("something cheap") — a real estate transaction-type list,
+inserted for a query that named no transaction type at all, with one
+value duplicated and another (`מסחרי`) missing. Reads like the model
+partially dumping the enum rather than extracting from the query.
+
+### G2 (gpt-5-nano, strict=false) — the capability hypothesis, tested and refuted at this tier
+
+The premise going in: V1's failure (gpt-4.1-nano garbling Hebrew object
+keys without constrained decoding) might be a nano-tier-specific
+capability gap, not inherent to dropping strict mode — so a different
+model family might not have it. **It's worse, not absent.** 0/8 valid,
+and the raw failures are more severely garbled than V1's, not less:
+
+```
+'טלפון זול'  -> {" ":null}
+'אוטו טוב'   -> {"סוג_יְכוֹל":"אוטו טוב"}
+'משהו זול'   -> {"מזגי_כספים":null}
+'בית יפה'    -> {"מצעי_אספשׁה":{...,"title":"מצעי نشست"}, ...}
+```
+
+None of these keys are real taxonomy fields, several aren't real Hebrew
+words at all, one embeds a literal null control character as a key, and
+one mixes in Persian/Arabic script (`نشست`, "session/sitting") inside a
+Hebrew field name — a cross-script hallucination that wasn't observed in
+V1. The hypothesis was directionally wrong at the nano tier: this is not
+"gpt-4.1-nano specifically is bad at Hebrew keys," it's "small models
+without constrained decoding are unreliable at Hebrew keys," and GPT-5-nano
+is not an exception.
+
+### G3 (gpt-5-mini, strict=false) — the hypothesis holds *directionally*, not sufficiently
+
+Triggered automatically per the run plan, since G2 failed validation.
+Validation improves markedly over G2 (50% vs 0%) — real evidence that a
+stronger model garbles Hebrew keys less, supporting the capability
+hypothesis as a *gradient*, not a binary. But 50% is still far below the
+88% baseline, and the failures that remain are a qualitatively different,
+softer kind — near-miss spelling variants of real field names rather than
+pure fabrication (`חנייה` vs. the taxonomy's `חניה`, `מפר_מגרש` vs.
+`מ״ר_מגרש`, `תיאור` — an invented field whose *value* was literally the
+string `"RealEstateParams"`, apparently echoing the Pydantic class name
+back rather than the field name). The "successful" responses were also
+suspiciously sparse — several passed validation at only 14 completion
+tokens, consistent with a near-empty `{}`-like object rather than a
+useful extraction; passing validation and being a *good* extraction
+aren't the same thing, and this round's pass-rate numbers don't
+distinguish them.
+
+### Verdict: no variant qualifies: production defaults unchanged
+
+The plan called for reporting a logprobs-removal trade-off analysis if
+any variant won on both latency and validation. **None did.** G1 loses on
+both axes outright. G2 fails validation completely. G3 improves on G2 but
+still trails the current baseline on validation (50% vs 88%) while its
+latency edge is undermined by how uninformative its passing responses
+look. G0 — the current production configuration in every dimension except
+`logprobs` (already `true` in production, tested here at `false` only to
+keep this comparison apples-to-apples with G1-G3) — remains the best
+measured option.
+
+Per instruction, **production defaults were not changed** as a result of
+this experiment; `reasoning_effort` was added to `OpenAIRepository.chat`
+as an optional parameter (unused by default) purely so this comparison
+could be run without a signature change blocking it later.
+
+Since no candidate qualified, the planned confidence-signal replacement
+analysis (embedding-only vs. rule-path-agreement vs. a blend) doesn't have
+a concrete trade-off to weigh this round — it would only become relevant
+if a future candidate actually won on both axes. For a future attempt: the
+natural next comparison this round didn't cover is `gpt-5-mini` **with**
+`strict=true` (G1 only tested nano at strict mode) — plausible given G3
+showed mini meaningfully outperforms nano's Hebrew-key reliability even
+without constrained decoding, so mini *with* constrained decoding might
+beat G0 outright, at gpt-5-mini's higher per-token price.

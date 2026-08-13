@@ -60,11 +60,18 @@ class OpenAIRepository:
         response_format: dict | None = None,
         logprobs: bool = False,
         max_completion_tokens: int | None = None,
+        reasoning_effort: str | None = None,
     ):
         """Send a chat completion request and return the raw response object
         (not just the text) — callers need ``.choices[0].logprobs`` for the
         confidence score and ``.usage`` for cost tracking, not only the
         completion text.
+
+        ``reasoning_effort`` is GPT-5-family-specific (e.g. "minimal") and
+        unused by production code today — added for the model-comparison
+        experiment in docs/infrastructure/latency-investigation.md, kept as
+        an optional parameter rather than a special case so a future
+        decision to adopt a GPT-5 model doesn't need another signature change.
         """
         if not settings.openai_api_key:
             log_event(event="llm_call_outcome", outcome="api_error", reason="missing_api_key", model=model)
@@ -77,6 +84,8 @@ class OpenAIRepository:
             request_kwargs["logprobs"] = True
         if max_completion_tokens is not None:
             request_kwargs["max_completion_tokens"] = max_completion_tokens
+        if reasoning_effort is not None:
+            request_kwargs["reasoning_effort"] = reasoning_effort
 
         try:
             response = await cls._get_client().chat.completions.create(**request_kwargs)
