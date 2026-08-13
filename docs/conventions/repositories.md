@@ -1,0 +1,82 @@
+# Repositories
+
+External I/O — the taxonomy file, the cache, and OpenAI — sits behind a
+repository. This is the seam that keeps the rest of the code testable and
+swappable.
+
+## The three repositories
+
+| Repository | Interface | Shipped implementation |
+|---|---|---|
+| `TaxonomyRepository` | concrete (loads once, read-only) | in-memory, loaded from `data/taxonomy.json` |
+| `CacheRepository` | abstract base (`abc.ABC`) | `InMemoryTTLCache` |
+| `OpenAIRepository` | concrete, OpenAI-specific | `AsyncOpenAI`-backed client |
+
+### `TaxonomyRepository` — the allowlist, loaded once
+
+`app/repositories/taxonomy_repository.py` reads `data/taxonomy.json` at
+import time and builds:
+- per-vertical Pydantic params models (`taxonomy_models.py`'s
+  `build_*_params_model` functions), each `extra="forbid"`;
+- a flat term index (`term_index`) mapping every known taxonomy value to
+  the `(vertical, field_name)` it belongs to — what the classifier scores
+  coverage against and the extractor fills fields from;
+- `taxonomy_version`, a content hash of the file, used as part of the
+  cache key so editing the taxonomy invalidates stale cache entries for
+  free (see [`../decisions/0001-hybrid-rule-first-llm-fallback-pipeline.md`](../decisions/0001-hybrid-rule-first-llm-fallback-pipeline.md)).
+
+There's no write path and no swappable-backend concern here — this is
+read-only, versioned configuration data, not a datastore. It's still a
+repository (not a bare module-level dict) because it owns the one piece of
+I/O (reading the file) and the one-time construction cost.
+
+### `CacheRepository` — storage behind an interface
+
+```python
+class CacheRepository(ABC):
+    @abstractmethod
+    def get(self, key: str) -> dict[str, Any] | None: ...
+    @abstractmethod
+    def set(self, key: str, value: dict[str, Any]) -> None: ...
+```
+
+`InMemoryTTLCache` backs it with `cachetools.TTLCache` — bounded size,
+time-based expiry, no hand-rolled eviction logic. A single module-level
+instance is what the service layer imports:
+
+```python
+cache_repository: CacheRepository = InMemoryTTLCache()
+```
+
+**To swap the backing store** (Redis, Memcached), write a new class that
+implements `CacheRepository` and change that one construction line. No
+service or router changes.
+
+### `OpenAIRepository` — OpenAI-specific, not provider-agnostic
+
+`app/repositories/openai_repository.py` wraps `openai.AsyncOpenAI`. Unlike
+a typical template's provider-agnostic `LlmRepository`, this class is named
+and shaped for OpenAI specifically — see
+[`../decisions/0002-openai-specific-repository.md`](../decisions/0002-openai-specific-repository.md)
+for why that's a deliberate choice here, not an oversight.
+
+It exposes `chat(...)` (returns the raw response — callers need
+`.choices[0].logprobs` and `.usage`, not just the text) and `embed(...)`.
+Both are `async def`, both check `settings.openai_api_key` up front and
+raise `OpenAIUnavailableError` immediately rather than attempting a call
+that would just fail — callers (`llm_fallback_service`) treat that
+uniformly with any other API failure as an `api_error` outcome.
+
+## Rules
+
+- **Repositories own I/O; nothing else does.** Services and routers never
+  call `AsyncOpenAI(...)` or read `data/taxonomy.json` directly.
+- **Return plain data**, not transport types.
+- **Keep the interface minimal.** Add a method when a caller needs it, not
+  speculatively.
+- **`@log_activity` on repository methods** so I/O shows up in traces.
+- **Metrics get recorded here too, not upstream.** Token/cost counters are
+  incremented inside `OpenAIRepository` right where `response.usage` is
+  available, and the cache-hit/miss counter is incremented inside
+  `CacheRepository.get` — co-locating the metric with the data it's
+  computed from, rather than reconstructing it later from a result object.
