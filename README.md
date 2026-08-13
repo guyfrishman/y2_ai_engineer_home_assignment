@@ -36,9 +36,9 @@ you want the deeper mental model.
 
 | Requirement | Implementation | Verified by (real measurement) |
 |---|---|---|
-| Latency: cache/rules p95 ≤150ms | In-process cache + pure-function rule pipeline, no I/O | **PASS** — p95 55.2ms (cache), 40.6ms (rules); see `scripts/loadtest.py` run below |
-| Latency: model path p95 ≤600ms | Two-tier OpenAI cascade, `api/app/services/llm_fallback_service.py` | **FAIL** — p95 6,660ms measured against the real API. Root-caused, not hidden: see [the honest writeup below](#a-real-non-functional-requirement-this-service-does-not-meet) |
-| Throughput ≥12 QPS/instance | Async end-to-end on the one real-I/O branch (`AsyncOpenAI`); sync CPU-bound rule path stays un-threaded (GIL — threading it measurably *increased* p95, see `docs/services/search-api.md`'s Quirks) | **PASS** — 29.76 QPS measured with real LLM traffic in the mix, 533+ QPS on a rules/cache-heavy mix |
+| Latency: cache/rules p95 ≤150ms | In-process cache + pure-function rule pipeline, no I/O | **PASS** at moderate concurrency (p95 55ms cache / 41ms rules); **degrades under heavy concurrent real-LLM traffic** (p95 532/572ms at 20 concurrent, ~27 of them real API calls) — see caveat below |
+| Latency: model path p95 ≤600ms | Two-tier OpenAI cascade, `api/app/services/llm_fallback_service.py` | **FAIL** — see the [full diagnosis below](#a-real-non-functional-requirement-this-service-does-not-meet): ~2.6s avg for an isolated, uncontended Tier 1 call alone, ~4x over budget before any concurrency is involved |
+| Throughput ≥12 QPS/instance | Async end-to-end on the one real-I/O branch (`AsyncOpenAI`); sync CPU-bound rule path stays un-threaded (GIL — threading it measurably *increased* p95, see `docs/services/search-api.md`'s Quirks) | **PASS** — 15-30 QPS measured with real LLM traffic in the mix (varies run-to-run against the live API), 533+ QPS on a rules/cache-heavy mix |
 | Caching (query, normalization) | Full-response cache (`api/app/repositories/cache_repository.py`, `cachetools.TTLCache`, taxonomy-version-keyed) **and** a separate word-level `functools.lru_cache` on typo correction (`normalizer_service.py`) | `api/tests/test_cache_repository.py`; `test_correct_word_is_memoized` |
 | Cost tracking, $/request, 10M/mo estimate | `api/app/metrics.py` (`parse_tokens_total`, `parse_cost_usd_total`) computed from a verified pricing table | [`docs/infrastructure/cost-model.md`](docs/infrastructure/cost-model.md) — real measured tokens, see summary below |
 | Observability: requests/category, error rate, p50/p95, cache hit ratio, tokens, cost, model success/failure | `api/app/metrics.py` — 6 custom Prometheus metrics + HTTP-level instrumentation | [`docs/infrastructure/observability.md`](docs/infrastructure/observability.md); live `GET /metrics` |
@@ -50,9 +50,12 @@ you want the deeper mental model.
 
 ### A real non-functional requirement this service does not meet
 
-The LLM-fallback path's p95 is **6.7 seconds against a 600ms target** —
-measured against the real OpenAI API, not simulated. Root-caused by
-isolating each variable independently:
+Measured against the real OpenAI API — the finding held up under a second
+round of scrutiny (isolating schema-caching, concurrency, and per-tier
+contribution as separate variables) and was diagnosed further, not
+softened.
+
+**Root cause, isolated by holding every other variable fixed:**
 
 | Configuration | Measured latency |
 |---|---|
@@ -63,14 +66,50 @@ isolating each variable independently:
 The JSON-schema-constrained decoding itself — not `logprobs`, not base
 model/network latency — is the dominant cost, and it was roughly flat
 across this project's three schemas (20–28 fields each), not clearly
-correlated with field count in that range. This is a genuine, unresolved
-gap. The credible paths to closing it, honestly not yet implemented:
+correlated with field count in that range.
+
+**Per-phase breakdown**, from 12 sequential (uncontended — no concurrency,
+so this isolates the per-call floor, not a contention artifact) real
+fallback calls across all three verticals:
+
+| Phase | Measured |
+|---|---|
+| Tier 1 call (non-escalated) | avg **2,613ms** (range 1,414–4,359ms) — already ~4x the 600ms budget alone |
+| Escalation rate | **2/12 = 17%** |
+| Total latency when escalated (Tier 1 attempt + Tier 2) | avg **4,901ms** — ≈1.9x a non-escalated request, roughly the "doubles" a two-step cascade implies |
+| Confidence-calc overhead (value-token logprob math + 2 embedding calls) | avg **173ms** (0–462ms) — real, but secondary next to the schema cost above |
+
+**Schema caching, checked directly — not the bug:** the same schema dict
+(byte-identical JSON across rebuilds, verified) was previously being
+reconstructed from the Pydantic model on every call rather than reused.
+That *was* a real, fixable inefficiency — now memoized with
+`functools.lru_cache` in `llm_fallback_service._strict_json_schema` — but
+since the wire content was already stable before the fix, this didn't
+change measured latency, which confirms the bottleneck is genuinely on
+OpenAI's serving side for a schema this size, not a caching bug in this
+codebase.
+
+**Under concurrent load, it gets worse, and so — surprisingly — does the
+cache/rules path.** A loadtest run with ~27 real concurrent fallback calls
+in the mix showed model-path p95 climbing to 8.8s (vs. the ~2.6s
+uncontended Tier-1 floor above — consistent with queuing/throttling on
+OpenAI's side under burst concurrent traffic from one API key) and,
+unexpectedly, cache/rules p95 also degrading to 500ms+ in that same run,
+despite that code path doing no network I/O of its own. That number was
+volatile run-to-run (fine in an earlier run at the same concurrency,
+degraded in a later one) — consistent with infra-level contention (client
+connection pooling, Docker Desktop's networking layer under sustained
+external call volume) rather than a code regression, but this wasn't
+isolated further and is reported as an open question, not a settled one.
+
+The credible paths to closing the core gap, honestly not yet implemented:
 scoping the `יד_שנייה` schema to the rule path's candidate subcategory
-instead of unioning all subcategories' fields; dropping strict-mode
-Structured Outputs for a looser prompt with post-hoc Pydantic validation;
-or a model confirmed faster at this schema complexity. Full detail:
-[`docs/services/search-api.md`](docs/services/search-api.md)'s Quirks
-section.
+instead of unioning all subcategories' fields (untested whether it would
+help, given latency looked flat across this project's 20–28-field range);
+dropping strict-mode Structured Outputs for a looser prompt with post-hoc
+Pydantic validation; or a model confirmed faster at this schema complexity.
+Full detail: [`docs/services/search-api.md`](docs/services/search-api.md)'s
+Quirks section.
 
 This is disclosed here deliberately, not in fine print — a README that
 only shows the numbers that pass isn't a credible README.
@@ -98,11 +137,11 @@ rule/dictionary classify + extract
 confidence >= 0.58? ──yes──► validate ─► cache write ─► return  (p95  41ms measured)
    │ no
    ▼
-OpenAI Tier 1 (gpt-4.1-nano, cheap)
+OpenAI Tier 1 (gpt-4.1-nano, cheap)      (avg 2.6s uncontended — see below)
    │
    ├─ success ──────────────────────────────────────► validate ─► cache write ─► return
    │
-   └─ validation failure / api_error
+   └─ validation failure / api_error  (17% of fallback calls, measured)
         │
         ▼
       OpenAI Tier 2 (gpt-4.1-mini, stronger)
@@ -113,7 +152,7 @@ OpenAI Tier 1 (gpt-4.1-nano, cheap)
              │
              ▼
            degrade to rule path's own result, confidence=0.15, notes flag
-           (p95 6,660ms measured when a real model call is attempted — see above)
+           (escalated requests avg 4.9s total — see the diagnosis below)
 ```
 
 Confidence is *measured*, not asserted, on every path: rule-path confidence

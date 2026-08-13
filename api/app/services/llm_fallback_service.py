@@ -9,6 +9,7 @@ below settings.confidence_threshold.
 No Tier 3. See docs/decisions/0001-hybrid-rule-first-llm-fallback-pipeline.md.
 """
 
+import functools
 import json
 from dataclasses import dataclass, field
 
@@ -38,11 +39,21 @@ class LlmFallbackResult:
     notes: list[str] = field(default_factory=list)
 
 
+@functools.lru_cache(maxsize=8)
 def _strict_json_schema(model_class: type[BaseModel]) -> dict:
     """Build an OpenAI Structured-Outputs strict-mode schema from a taxonomy
     params model: every object needs additionalProperties=False and every
     property listed in required (nullable types carry the "optional" meaning
-    instead, since every field in our models is Optional already)."""
+    instead, since every field in our models is Optional already).
+
+    Cached per model class (there are only 3 — one per vertical, each a
+    stable, reused class built once at TaxonomyRepository construction) —
+    the derivation is deterministic, so there's no reason to rebuild an
+    ~3.5KB dict from scratch on every fallback call. The schema's actual
+    JSON content was already verified byte-identical across rebuilds
+    before this cache was added; this only removes wasted CPU work, it
+    doesn't change what's sent over the wire.
+    """
     schema = model_class.model_json_schema()
     defs = schema.get("$defs", {})
     _force_strict_recursive(schema, defs)

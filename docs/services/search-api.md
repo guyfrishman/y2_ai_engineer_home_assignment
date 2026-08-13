@@ -108,16 +108,47 @@ docker compose up --build
   regardless of which vertical's schema is used. Isolated by testing with
   and without the schema, and with and without `logprobs`, independently —
   the JSON-schema constrained decoding itself is the dominant cost, not
-  `logprobs` (a smaller, ~500ms contributor) and not base
-  network/model latency. The credible paths to closing this gap, not yet
-  implemented: (1) scope the `יד_שנייה` schema to just the rule path's
-  candidate subcategory instead of unioning all subcategories' fields —
-  untested whether this helps meaningfully, since latency looked roughly
-  flat across this project's 20–28-field range; (2) drop strict-mode
-  Structured Outputs in favor of a looser prompt + post-hoc Pydantic
-  validation (trades schema-enforced generation for speed — validation
-  still catches a bad shape, just without generation-time constraint);
-  (3) a faster/smaller model, if one is found to support both Structured
-  Outputs and `logprobs` reliably at lower latency. See the root README's
+  `logprobs` (a smaller, ~500ms contributor) and not base network/model
+  latency.
+
+  Per-phase breakdown, from 12 sequential (uncontended) real fallback
+  calls: Tier 1 alone averages **2,613ms** (already ~4x budget with zero
+  concurrency involved); Tier 2 escalation fires on **17%** of fallback
+  calls (2/12 in this sample), and an escalated request's total latency
+  (Tier 1 attempt + Tier 2) averages **4,901ms** — ≈1.9x a non-escalated
+  request, roughly the "doubles" a two-step cascade implies; the
+  confidence-calc step (value-token logprob math, which is local/cheap,
+  plus 2 embedding API calls) adds a further **~173ms average** — real,
+  but secondary next to the schema cost.
+
+  Schema-reuse was checked directly, not assumed: `_strict_json_schema`'s
+  output was verified byte-identical across repeated rebuilds for the same
+  model class, but was previously being reconstructed from scratch on
+  every call rather than cached — a real, fixable inefficiency, now fixed
+  via `functools.lru_cache`. Since the wire content was already stable
+  before that fix, memoizing it didn't change measured latency, which
+  confirms the bottleneck is on OpenAI's serving side for a schema this
+  size, not a caching bug in this codebase.
+
+  Under concurrent load (a loadtest run with ~27 real fallback calls in
+  flight) model-path p95 climbed further to 8.8s — consistent with
+  queuing/throttling under burst concurrent traffic from one API key — and
+  the cache/rules path's own p95 also degraded in that same run (500ms+,
+  despite doing no network I/O), though that number was volatile
+  run-to-run at the same concurrency level and wasn't isolated further; it
+  reads as infra-level contention (client connection pooling, or Docker
+  Desktop's networking layer under sustained external call volume) rather
+  than a confirmed code regression, and is reported as an open question.
+
+  The credible paths to closing the core gap, not yet implemented: (1)
+  scope the `יד_שנייה` schema to just the rule path's candidate
+  subcategory instead of unioning all subcategories' fields — untested
+  whether this helps meaningfully, since latency looked roughly flat
+  across this project's 20–28-field range; (2) drop strict-mode Structured
+  Outputs in favor of a looser prompt + post-hoc Pydantic validation
+  (trades schema-enforced generation for speed — validation still catches
+  a bad shape, just without generation-time constraint); (3) a
+  faster/smaller model, if one is found to support both Structured Outputs
+  and `logprobs` reliably at lower latency. See the root README's
   Non-Functional Requirements table for the measured numbers this claim is
   based on.
