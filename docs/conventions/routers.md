@@ -21,7 +21,6 @@ Rules:
 
 ```python
 from fastapi import APIRouter, HTTPException, Response, status
-from app.logger import log_activity
 from app.schema.requests import ParseRequest
 from app.schema.responses import ParseResponse
 from app.services.parse_service import parse_query
@@ -31,7 +30,6 @@ router = APIRouter()
 
 
 @router.post("/parse", summary="Parse a Hebrew free-text search query", response_model=ParseResponse)
-@log_activity
 async def parse(request: ParseRequest, response: Response):
     try:
         result = await parse_query(request.q)
@@ -46,7 +44,11 @@ Rules:
 - Every route has `summary=` (shows in Swagger) and, where it returns a
   body, `response_model=`.
 - Handler names are **short verb-nouns**: `parse`, `health`.
-- `@log_activity` on every handler.
+- No per-handler logging decorator — `main.py`'s middleware sets
+  `trace_id` once per request and logs the one exception-boundary event if
+  something unhandled reaches it; the service layer logs its own decision
+  points. See [logging.md](logging.md) for why a blanket decorator was
+  tried and removed.
 - Handlers are **thin** — delegate to a service immediately. No taxonomy
   logic, no model calls, no cache access in a router. The one exception is
   translating a domain exception (`QueryRejectedError`) into the right HTTP
@@ -84,11 +86,12 @@ Instrumentator().instrument(app).expose(app)
 - Known errors (empty-after-sanitization query, bad request shape): raise
   `HTTPException` with a clear `detail`, or let FastAPI's own Pydantic
   validation produce the 422.
-- Unknown errors: let them bubble — `@log_activity` records them as `ERROR`
-  and FastAPI returns 500. This should be rare: the LLM-fallback path's own
-  failure modes (bad JSON, invalid schema, network error) are all caught
-  and turned into a graceful degrade inside `llm_fallback_service`, never a
-  raised exception that reaches the router.
+- Unknown errors: let them bubble — `main.py`'s middleware logs one
+  `request_error` event at the boundary and FastAPI returns 500 (see
+  [logging.md](logging.md)). This should be rare: the LLM-fallback path's
+  own failure modes (bad JSON, invalid schema, network error) are all
+  caught and turned into a graceful degrade inside `llm_fallback_service`,
+  never a raised exception that reaches the router.
 
 ## Why this exact pattern
 

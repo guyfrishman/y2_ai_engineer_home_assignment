@@ -70,7 +70,7 @@ sanitize -> normalize -> cache lookup --hit--> return (<=150ms)
 ```
 api/app/
 ├── config.py            # typed settings (env-driven)
-├── logger.py             # @log_activity + session/trace ContextVars
+├── logger.py             # log_event + trace_id ContextVar (set by middleware)
 ├── security.py           # X-API-Key dependency
 ├── metrics.py             # custom Prometheus counters/histograms
 ├── data/taxonomy.json     # vendored copy of spec/yad2_search_taxonomy.json

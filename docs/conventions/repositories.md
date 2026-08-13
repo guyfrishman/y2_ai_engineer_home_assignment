@@ -74,7 +74,9 @@ uniformly with any other API failure as an `api_error` outcome.
 - **Return plain data**, not transport types.
 - **Keep the interface minimal.** Add a method when a caller needs it, not
   speculatively.
-- **`@log_activity` on repository methods** so I/O shows up in traces.
+- **`log_event(...)` at real decision points inside repository methods**
+  (a cache hit/miss, a model call's outcome) — see
+  [logging.md](logging.md). Not a blanket per-method decorator.
 - **Metrics get recorded here too, not upstream.** Token/cost counters are
   incremented inside `OpenAIRepository` right where `response.usage` is
   available, and the cache-hit/miss counter is incremented inside

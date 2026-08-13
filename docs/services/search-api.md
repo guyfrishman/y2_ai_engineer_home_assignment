@@ -25,7 +25,7 @@ api/
 ├── main.py                  # mounts routers, wires Instrumentator
 ├── app/
 │   ├── config.py             # Settings
-│   ├── logger.py              # @log_activity / log_metric
+│   ├── logger.py              # log_event, trace_id ContextVar
 │   ├── security.py             # X-API-Key dependency
 │   ├── metrics.py               # custom Prometheus counters/histograms
 │   ├── data/taxonomy.json        # vendored copy of spec/yad2_search_taxonomy.json
@@ -131,14 +131,22 @@ docker compose up --build
   size, not a caching bug in this codebase.
 
   Under concurrent load (a loadtest run with ~27 real fallback calls in
-  flight) model-path p95 climbed further to 8.8s — consistent with
+  flight) model-path p95 climbed further — consistent with
   queuing/throttling under burst concurrent traffic from one API key — and
-  the cache/rules path's own p95 also degraded in that same run (500ms+,
-  despite doing no network I/O), though that number was volatile
-  run-to-run at the same concurrency level and wasn't isolated further; it
-  reads as infra-level contention (client connection pooling, or Docker
-  Desktop's networking layer under sustained external call volume) rather
-  than a confirmed code regression, and is reported as an open question.
+  the cache/rules path's own p95 also degraded in the same runs (200-700ms
+  across several, despite doing no network I/O). One candidate cause was
+  tested directly: `@log_activity` (a `json.dumps` + recursive truncation
+  on every function call) was removed entirely as part of the logging
+  rewrite (`docs/conventions/logging.md`), and the same loadtest re-run at
+  the same concurrency showed **no improvement** — cache/rules p95 was
+  still 200-700ms. Across three runs total, cache-only traffic (no
+  concurrent LLM calls) was consistently fast (~50ms); any run with real
+  concurrent LLM traffic showed the degradation, with or without
+  `@log_activity`. That rules out the logging decorator as the cause and
+  points toward infra-level contention (client connection pooling, or
+  Docker Desktop's networking layer under sustained external call volume)
+  instead — not isolated further than that, but no longer an open question
+  about *whether* logging was responsible.
 
   The credible paths to closing the core gap, not yet implemented: (1)
   scope the `יד_שנייה` schema to just the rule path's candidate

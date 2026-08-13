@@ -3,118 +3,13 @@
 A FastAPI service that converts a Hebrew free-text marketplace query
 (`"דירת 3 חדרים בירושלים עד מליון שח"`) into structured, taxonomy-validated
 search parameters for one of three Yad2 verticals (נדל״ן / רכב / יד_שנייה).
-It runs a hybrid pipeline: a rule/dictionary classifier and extractor
-handle the majority of traffic at zero marginal cost and sub-150ms
-latency, falling back to a two-tier OpenAI cascade — cheap model first,
-escalating only on validation failure, degrading gracefully rather than
-failing if that's unavailable — for the queries rules genuinely can't
-resolve. Every field either path can emit is dynamically generated from
-`spec/yad2_search_taxonomy.json`, so there is no code path that can invent
-a field outside the taxonomy.
-
-**`INSTRUCTIONS.md`** holds the original assignment brief, untouched.
-**`docs/`** holds the full design rationale, conventions, and ADRs this
-README summarizes — start at [`docs/onboarding.md`](docs/onboarding.md) if
-you want the deeper mental model.
-
----
-
-## Functional Requirements
-
-| Requirement | Implementation | Verified by |
-|---|---|---|
-| `POST /parse`: Hebrew text → `{category, params, confidence, notes}` | `api/app/routers/search.py`, `api/app/services/parse_service.py` | `api/tests/test_parse_api.py`; live `curl` — see Quickstart |
-| Detect vertical (נדל״ן / רכב / יד_שנייה) | `api/app/services/classifier_service.py` — taxonomy-term coverage scoring | `api/tests/test_classifier_service.py` |
-| Extract + normalize fields per taxonomy only | `api/app/services/extractor_service.py` + `api/app/schema/taxonomy_models.py` (dynamically built, `extra="forbid"`, `Literal`-typed enums, cross-field sector/subcategory check) | `api/tests/test_extractor_service.py`, `api/tests/test_security_redteam.py` |
-| Reject/flag unknown fields, never invent keys | Same taxonomy models — structurally impossible to emit an unlisted field | `test_pydantic_model_rejects_a_directly_injected_unknown_field`, `test_extracted_params_never_include_a_field_outside_the_taxonomy` |
-| `GET /health` | `api/app/routers/ping.py` — also reports `taxonomy_version` | `test_health_is_open_and_reports_taxonomy_version` |
-| `GET /metrics` | `api/app/metrics.py` + `prometheus-fastapi-instrumentator`, wired in `api/main.py` | `test_metrics_endpoint_is_open_and_exposes_custom_counters`; live `curl` |
-| Typo/slang tolerance | `api/app/services/normalizer_service.py` — static typo map + `rapidfuzz` fuzzy fallback + preposition-prefix stripping | `api/tests/test_normalizer_service.py`; slang cases in `test_security_redteam.py` |
-| 5-10 worked examples with expected JSON | [`docs/examples.md`](docs/examples.md) — 8 examples, all asserted in `api/tests/test_extractor_service.py` | Re-run: `uv run pytest tests/test_extractor_service.py -v` |
-
-## Non-Functional Requirements
-
-| Requirement | Implementation | Verified by (real measurement) |
-|---|---|---|
-| Latency: cache/rules p95 ≤150ms | In-process cache + pure-function rule pipeline, no I/O | **PASS** at moderate concurrency (p95 55ms cache / 41ms rules); **degrades under heavy concurrent real-LLM traffic** (p95 532/572ms at 20 concurrent, ~27 of them real API calls) — see caveat below |
-| Latency: model path p95 ≤600ms | Two-tier OpenAI cascade, `api/app/services/llm_fallback_service.py` | **FAIL** — see the [full diagnosis below](#a-real-non-functional-requirement-this-service-does-not-meet): ~2.6s avg for an isolated, uncontended Tier 1 call alone, ~4x over budget before any concurrency is involved |
-| Throughput ≥12 QPS/instance | Async end-to-end on the one real-I/O branch (`AsyncOpenAI`); sync CPU-bound rule path stays un-threaded (GIL — threading it measurably *increased* p95, see `docs/services/search-api.md`'s Quirks) | **PASS** — 15-30 QPS measured with real LLM traffic in the mix (varies run-to-run against the live API), 533+ QPS on a rules/cache-heavy mix |
-| Caching (query, normalization) | Full-response cache (`api/app/repositories/cache_repository.py`, `cachetools.TTLCache`, taxonomy-version-keyed) **and** a separate word-level `functools.lru_cache` on typo correction (`normalizer_service.py`) | `api/tests/test_cache_repository.py`; `test_correct_word_is_memoized` |
-| Cost tracking, $/request, 10M/mo estimate | `api/app/metrics.py` (`parse_tokens_total`, `parse_cost_usd_total`) computed from a verified pricing table | [`docs/infrastructure/cost-model.md`](docs/infrastructure/cost-model.md) — real measured tokens, see summary below |
-| Observability: requests/category, error rate, p50/p95, cache hit ratio, tokens, cost, model success/failure | `api/app/metrics.py` — 6 custom Prometheus metrics + HTTP-level instrumentation | [`docs/infrastructure/observability.md`](docs/infrastructure/observability.md); live `GET /metrics` |
-| Structured logs: parsing decisions & security events | `api/app/logger.py`'s `log_metric` — security events use a distinct `security_`-prefixed `event=` tag, greppable separately | [`docs/conventions/logging.md`](docs/conventions/logging.md) |
-| Fixed system prompts, allowlisted fields | `api/app/prompts/system_prompts.py` — never interpolates user input beyond the vertical name | [`docs/conventions/llm-usage.md`](docs/conventions/llm-usage.md) |
-| Strict JSON Schema validation | Taxonomy Pydantic models, `extra="forbid"`, `Literal` enums, cross-field validator; same models used for both the rule path and as the LLM's Structured Outputs schema | `api/tests/test_llm_fallback_service.py::test_strict_json_schema_has_no_optional_fields_and_forbids_extras` |
-| Input sanitization (emoji/control chars/length) | `api/app/services/sanitizer_service.py` | `api/tests/test_sanitizer_service.py` |
-| Red-team tests (injection, unicode, oversized, slang) | `api/tests/test_security_redteam.py` — 23 tests | `uv run pytest tests/test_security_redteam.py -v` — all pass |
-
-### A real non-functional requirement this service does not meet
-
-Measured against the real OpenAI API — the finding held up under a second
-round of scrutiny (isolating schema-caching, concurrency, and per-tier
-contribution as separate variables) and was diagnosed further, not
-softened.
-
-**Root cause, isolated by holding every other variable fixed:**
-
-| Configuration | Measured latency |
-|---|---|
-| Plain chat completion, no schema | ~500-850ms |
-| + Structured Outputs strict-mode schema (this service's taxonomy models) | **~2,000-3,000ms** |
-| + `logprobs=True` on top of the schema | +~500ms |
-
-The JSON-schema-constrained decoding itself — not `logprobs`, not base
-model/network latency — is the dominant cost, and it was roughly flat
-across this project's three schemas (20–28 fields each), not clearly
-correlated with field count in that range.
-
-**Per-phase breakdown**, from 12 sequential (uncontended — no concurrency,
-so this isolates the per-call floor, not a contention artifact) real
-fallback calls across all three verticals:
-
-| Phase | Measured |
-|---|---|
-| Tier 1 call (non-escalated) | avg **2,613ms** (range 1,414–4,359ms) — already ~4x the 600ms budget alone |
-| Escalation rate | **2/12 = 17%** |
-| Total latency when escalated (Tier 1 attempt + Tier 2) | avg **4,901ms** — ≈1.9x a non-escalated request, roughly the "doubles" a two-step cascade implies |
-| Confidence-calc overhead (value-token logprob math + 2 embedding calls) | avg **173ms** (0–462ms) — real, but secondary next to the schema cost above |
-
-**Schema caching, checked directly — not the bug:** the same schema dict
-(byte-identical JSON across rebuilds, verified) was previously being
-reconstructed from the Pydantic model on every call rather than reused.
-That *was* a real, fixable inefficiency — now memoized with
-`functools.lru_cache` in `llm_fallback_service._strict_json_schema` — but
-since the wire content was already stable before the fix, this didn't
-change measured latency, which confirms the bottleneck is genuinely on
-OpenAI's serving side for a schema this size, not a caching bug in this
-codebase.
-
-**Under concurrent load, it gets worse, and so — surprisingly — does the
-cache/rules path.** A loadtest run with ~27 real concurrent fallback calls
-in the mix showed model-path p95 climbing to 8.8s (vs. the ~2.6s
-uncontended Tier-1 floor above — consistent with queuing/throttling on
-OpenAI's side under burst concurrent traffic from one API key) and,
-unexpectedly, cache/rules p95 also degrading to 500ms+ in that same run,
-despite that code path doing no network I/O of its own. That number was
-volatile run-to-run (fine in an earlier run at the same concurrency,
-degraded in a later one) — consistent with infra-level contention (client
-connection pooling, Docker Desktop's networking layer under sustained
-external call volume) rather than a code regression, but this wasn't
-isolated further and is reported as an open question, not a settled one.
-
-The credible paths to closing the core gap, honestly not yet implemented:
-scoping the `יד_שנייה` schema to the rule path's candidate subcategory
-instead of unioning all subcategories' fields (untested whether it would
-help, given latency looked flat across this project's 20–28-field range);
-dropping strict-mode Structured Outputs for a looser prompt with post-hoc
-Pydantic validation; or a model confirmed faster at this schema complexity.
-Full detail: [`docs/services/search-api.md`](docs/services/search-api.md)'s
-Quirks section.
-
-This is disclosed here deliberately, not in fine print — a README that
-only shows the numbers that pass isn't a credible README.
-
----
+A rule/dictionary classifier and extractor handle the majority of traffic
+at zero marginal cost and sub-150ms latency; a two-tier OpenAI cascade —
+cheap model first, escalating only on validation failure, degrading
+gracefully rather than failing if that's unavailable — covers the queries
+rules genuinely can't resolve. Every field either path can emit comes
+straight out of `spec/yad2_search_taxonomy.json`, dynamically, so there is
+no code path that can invent a field outside the taxonomy.
 
 ## Pipeline
 
@@ -152,7 +47,6 @@ OpenAI Tier 1 (gpt-4.1-nano, cheap)      (avg 2.6s uncontended — see below)
              │
              ▼
            degrade to rule path's own result, confidence=0.15, notes flag
-           (escalated requests avg 4.9s total — see the diagnosis below)
 ```
 
 Confidence is *measured*, not asserted, on every path: rule-path confidence
@@ -161,40 +55,6 @@ LLM tier's confidence blends the completion's own value-token logprobs
 with an embedding cross-check; only the final degrade uses a fixed
 constant, because there's genuinely nothing to measure there. Full
 rationale: [`docs/decisions/0001-hybrid-rule-first-llm-fallback-pipeline.md`](docs/decisions/0001-hybrid-rule-first-llm-fallback-pipeline.md).
-
----
-
-## Cost model
-
-Real measured tokens (4 live Tier 1 calls, `gpt-4.1-nano`): **3,323.5 avg
-prompt tokens, 191.2 avg completion tokens** per fallback call, plus ~49
-embedding tokens for the confidence cross-check. At verified pricing
-($0.10/$0.40 per 1M tokens):
-
-**$0.000410/request** for a Tier-1-only fallback; **~$0.000655/request**
-blended assuming a conservative 15% Tier-2-escalation rate.
-
-| Scenario | Cache hit | Monthly cost (10M queries) | $/request |
-|---|---|---|---|
-| Conservative | 20% | $2,096 | $0.00021 |
-| Moderate | 50% | $1,310 | $0.00013 |
-| Optimistic | 60% | $917 | $0.00009 |
-
-**Even the conservative scenario is ~$2,100/month for 10M queries** —
-because caching and the rule-first classifier mean the LLM only ever
-touches the minority of traffic. Levers actually implemented: full-response
-caching, word-level normalization caching, the rule-first classifier
-itself, and two-tier escalation (cheapest suitable model first). Falls out
-of the design for free: OpenAI's automatic prompt-caching discount on the
-repeated fixed system prompt (not yet observed in this project's own
-measurements — `cached_tokens: 0` — the baseline above is conservative and
-doesn't assume it). Deliberately not used on the main path: embeddings —
-rules are cheaper, deterministic, and the only way to hit the 150ms
-cache/rules SLA; embeddings are used narrowly for the LLM-tier confidence
-cross-check only. Full breakdown, formulas, and caveats:
-[`docs/infrastructure/cost-model.md`](docs/infrastructure/cost-model.md).
-
----
 
 ## Quickstart
 
@@ -219,23 +79,54 @@ curl http://localhost:8000/health
 curl http://localhost:8000/metrics
 ```
 
-Run the test suite (90 tests, no network, ~1.5s):
 ```bash
-cd api && uv run pytest
-```
-
-Run the load test against a running instance:
-```bash
+cd api && uv run pytest                                              # 94 tests, no network, ~1.5s
 cd api && uv run python ../scripts/loadtest.py --requests 200 --concurrency 20
 ```
 
-## More
+## The honest finding: the model-path latency target isn't met
+
+Cache/rules p95 passes (≤150ms). The 600ms model-path target does not —
+measured p95 well into multi-second territory against the real API, root
+caused (not just observed): Structured Outputs strict mode forces every
+optional field into the response as an explicit `null`, so a 20-28-field
+taxonomy schema costs ~2-3s of real generation time per call regardless of
+how few fields the query actually needs. A controlled experiment
+confirmed the direction (dropping strict mode cut latency 56%) and why
+it's not adopted (validation collapsed to 12% — this nano-tier model
+doesn't reliably reproduce correct Hebrew object keys without constrained
+decoding). Full diagnosis, every number, and the write-behind architecture
+recommended as the real next step: **[`docs/requirements.md`](docs/requirements.md)**.
+
+This is on the front page deliberately — a README that only shows the
+numbers that pass isn't a credible one.
+
+## Cost model
+
+Real measured tokens (4 live Tier 1 calls, `gpt-4.1-nano`): **3,323.5 avg
+prompt tokens, 191.2 avg completion tokens** per fallback call. At
+verified pricing, **$0.000410/request** for a Tier-1-only fallback,
+**~$0.000655/request** blended at a conservative 15% Tier-2 rate.
+
+| Scenario | Cache hit | Monthly cost (10M queries) | $/request |
+|---|---|---|---|
+| Conservative | 20% | $2,096 | $0.00021 |
+| Optimistic | 60% | $917 | $0.00009 |
+
+Even the conservative scenario is ~$2,100/month for 10M queries, because
+caching and the rule-first classifier mean the LLM only ever touches the
+minority of traffic. Levers implemented: full-response + word-level
+normalization caching, the rule-first classifier itself, two-tier
+escalation. Full breakdown and what's discussed-but-not-implemented (OpenAI
+prompt caching, embeddings-vs-rules): [`docs/infrastructure/cost-model.md`](docs/infrastructure/cost-model.md).
+
+## Docs
 
 - [`docs/onboarding.md`](docs/onboarding.md) — mental model, 5-minute run
-- [`docs/AGENTS.md`](docs/AGENTS.md) — how to work in this repo
-- [`docs/conventions/`](docs/conventions/) — routers, repositories, logging, config, LLM usage, testing, code style, work protocol
-- [`docs/decisions/`](docs/decisions/) — the two ADRs behind this design
+- [`docs/requirements.md`](docs/requirements.md) — full functional/non-functional requirement tables + the complete latency diagnosis
+- [`docs/AGENTS.md`](docs/AGENTS.md) · [`docs/conventions/`](docs/conventions/) — how this repo is built and why
+- [`docs/decisions/`](docs/decisions/) — the ADRs behind this design
 - [`docs/services/search-api.md`](docs/services/search-api.md) — service reference, including known quirks
-- [`docs/infrastructure/`](docs/infrastructure/) — observability, cost model, confidence calibration
+- [`docs/infrastructure/`](docs/infrastructure/) — observability, cost model, confidence calibration, latency investigation
 - [`docs/examples.md`](docs/examples.md) — 8 worked examples across all 3 verticals
-- [`INSTRUCTIONS.md`](INSTRUCTIONS.md) — the original assignment brief
+- [`INSTRUCTIONS.md`](INSTRUCTIONS.md) — the original assignment brief, untouched

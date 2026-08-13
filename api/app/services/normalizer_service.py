@@ -9,7 +9,6 @@ import re
 
 from rapidfuzz import fuzz, process
 
-from app.logger import log_activity
 from app.repositories.taxonomy_repository import taxonomy_repository
 
 WORD_CORRECTION_CACHE_SIZE = 8192
@@ -155,7 +154,6 @@ def _should_correct(word: str) -> bool:
     return True
 
 
-@log_activity
 def normalize_query(sanitized_query: str) -> str:
     """Produce the canonical query string: magnitude words and currency
     words expanded/canonicalized, between-phrases rewritten as dashed

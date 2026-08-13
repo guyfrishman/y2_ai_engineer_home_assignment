@@ -73,3 +73,46 @@ latency targets (p95 ≤150ms cache/rules, p95 ≤600ms model path); "classifier
 + selective calls" as a named cost-reduction option; "Strict JSON Schema
 validation"; "allowlisted fields/categories"; confidence as a required
 response field.
+
+## Future direction: write-behind / optimistic degrade (not implemented)
+
+The measured LLM-fallback latency (`docs/infrastructure/latency-investigation.md`:
+~2.6s for an isolated Tier 1 call alone, before any escalation) means the
+600ms model-path target isn't reachable by making the model call faster
+within the current request-response contract — see the root README's
+honest latency writeup. The next architectural step worth considering, **not
+implemented here**, is removing the LLM call from the request's own
+critical path entirely:
+
+**The idea:** when rule-path confidence is below threshold, return the
+rule path's own result immediately (same as today's degrade path — sub-threshold
+confidence, honest about it), but *also* kick off the Tier 1/Tier 2
+cascade in the background, writing its result into the cache under the
+same key once it completes. The request that triggered the LLM call never
+waits for it. The next request for the *same* canonical query — and at
+Yad2's real scale, popular searches recur constantly, a Zipfian
+distribution where a small number of distinct queries account for a large
+share of traffic — hits the cache and gets the LLM-refined answer,
+converged on without ever paying LLM latency in a request's critical path.
+
+**Why this is the right next step, not a nice-to-have:** it doesn't try to
+make the model faster (this ADR's diagnosis shows that's a serving-side
+constraint, not something this codebase controls) — it changes *who pays*
+for that latency. Under Zipfian traffic, p95 across all requests collapses
+to the rules path's latency (already meeting the 150ms target), because
+the LLM tier's cost gets paid once per distinct rare query and amortized
+across every repeat, off the critical path.
+
+**The trade-off, stated plainly:** the *first* caller of a genuinely rare,
+long-tail query — one no other user has asked yet — gets the weaker,
+lower-confidence rule-path answer, honestly labeled as such, not the
+LLM-refined one. Today's synchronous design guarantees every caller gets
+the best available answer, at the cost of that caller sometimes waiting
+several seconds for it. Write-behind guarantees every caller gets a fast
+answer, at the cost of first-time askers of rare queries getting a weaker
+one. That's a real semantic change to what `/parse` promises its caller —
+a product decision (is "always fast, sometimes provisional" an acceptable
+contract, versus today's "always best-effort, sometimes slow"), not a
+performance tweak to make unilaterally inside this service. Recorded here
+as the recommended next step for production scale, with the trade-off
+explicit, for whoever owns that decision to make.

@@ -15,6 +15,10 @@ PARSE_CACHE_RESULT_TOTAL = Counter(
     "parse_cache_result_total", "Cache lookup outcomes", ["result"]  # hit | miss
 )
 
+PARSE_ERRORS_TOTAL = Counter(
+    "parse_errors_total", "Requests that raised mid-pipeline, including QueryRejectedError (routed to a 400)"
+)
+
 PARSE_MODEL_CALLS_TOTAL = Counter(
     "parse_model_calls_total",
     "LLM fallback calls by tier and outcome",

@@ -1,6 +1,5 @@
 from fastapi import APIRouter, HTTPException, Response, status
 
-from app.logger import log_activity
 from app.schema.requests import ParseRequest
 from app.schema.responses import ParseResponse
 from app.services.parse_service import parse_query
@@ -10,7 +9,6 @@ router = APIRouter()
 
 
 @router.post("/parse", summary="Parse a Hebrew free-text search query", response_model=ParseResponse)
-@log_activity
 async def parse(request: ParseRequest, response: Response):
     # parse_query is async end-to-end on the LLM-fallback branch (the
     # service's only real network I/O) via OpenAIRepository's AsyncOpenAI

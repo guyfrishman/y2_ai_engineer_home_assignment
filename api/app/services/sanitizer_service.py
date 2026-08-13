@@ -5,7 +5,7 @@ no network calls."""
 import unicodedata
 
 from app.config import settings
-from app.logger import log_activity, log_metric
+from app.logger import log_event
 
 # Unicode general categories treated as noise for a short Hebrew search
 # query: Cc/Cf/Co/Cs are control/format/private-use/surrogate characters
@@ -23,7 +23,6 @@ def _is_disallowed_character(character: str) -> bool:
     return unicodedata.category(character) in _DISALLOWED_UNICODE_CATEGORIES
 
 
-@log_activity
 def sanitize_query(raw_query: str) -> str:
     """Strip control characters and emoji, then cap the result to
     ``settings.max_query_length``. Raises ``QueryRejectedError`` if nothing
@@ -36,14 +35,14 @@ def sanitize_query(raw_query: str) -> str:
     ).strip()
 
     if disallowed_character_count:
-        log_metric(
+        log_event(
             event="security_input_rejected",
             reason="disallowed_characters_stripped",
             stripped_count=disallowed_character_count,
         )
 
     if len(cleaned) > settings.max_query_length:
-        log_metric(
+        log_event(
             event="security_input_rejected",
             reason="max_length_exceeded",
             original_length=len(raw_query),
@@ -52,7 +51,7 @@ def sanitize_query(raw_query: str) -> str:
         cleaned = cleaned[: settings.max_query_length].strip()
 
     if not cleaned:
-        log_metric(event="security_input_rejected", reason="empty_after_sanitization")
+        log_event(event="security_input_rejected", reason="empty_after_sanitization")
         raise QueryRejectedError("query is empty after sanitization")
 
     return cleaned

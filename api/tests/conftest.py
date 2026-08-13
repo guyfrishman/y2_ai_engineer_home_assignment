@@ -21,7 +21,7 @@ def mock_llm(monkeypatch):
     the LLM fallback to resolve, not to assert on specific extracted values.
     """
 
-    async def fake_chat(messages, model, response_format=None, logprobs=False):
+    async def fake_chat(messages, model, response_format=None, logprobs=False, max_completion_tokens=None):
         from types import SimpleNamespace
 
         content = "{}"

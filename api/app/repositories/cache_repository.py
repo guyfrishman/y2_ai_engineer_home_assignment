@@ -12,7 +12,7 @@ from typing import Any
 from cachetools import TTLCache
 
 from app.config import settings
-from app.logger import log_activity, log_metric
+from app.logger import log_event
 from app.metrics import PARSE_CACHE_RESULT_TOTAL
 from app.repositories.taxonomy_repository import taxonomy_repository
 
@@ -46,15 +46,13 @@ class InMemoryTTLCache(CacheRepository):
     def __init__(self) -> None:
         self._cache: TTLCache = TTLCache(maxsize=settings.cache_max_size, ttl=settings.cache_ttl_seconds)
 
-    @log_activity
     def get(self, key: str) -> dict[str, Any] | None:
         value = self._cache.get(key)
         result = "hit" if value is not None else "miss"
-        log_metric(event="cache_lookup", result=result)
+        log_event(event="cache_lookup", result=result)
         PARSE_CACHE_RESULT_TOTAL.labels(result=result).inc()
         return value
 
-    @log_activity
     def set(self, key: str, value: dict[str, Any]) -> None:
         self._cache[key] = value
 

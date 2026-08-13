@@ -41,7 +41,7 @@ def _rule_path_params() -> object:
 async def test_tier1_success_never_calls_tier2(monkeypatch):
     calls = []
 
-    async def fake_chat(messages, model, response_format=None, logprobs=False):
+    async def fake_chat(messages, model, response_format=None, logprobs=False, max_completion_tokens=None):
         calls.append(model)
         return _fake_response({"יצרן": "טויוטה", "דגם": "קורולה"})
 
@@ -58,7 +58,7 @@ async def test_tier1_success_never_calls_tier2(monkeypatch):
 async def test_tier1_validation_failure_escalates_to_tier2(monkeypatch):
     calls = []
 
-    async def fake_chat(messages, model, response_format=None, logprobs=False):
+    async def fake_chat(messages, model, response_format=None, logprobs=False, max_completion_tokens=None):
         calls.append(model)
         if model == settings.openai_fallback_model:
             # "שנה" (year) must be a number per the taxonomy — this fails
@@ -76,7 +76,7 @@ async def test_tier1_validation_failure_escalates_to_tier2(monkeypatch):
 
 
 async def test_both_tiers_fail_validation_degrades_to_rule_path(monkeypatch):
-    async def fake_chat(messages, model, response_format=None, logprobs=False):
+    async def fake_chat(messages, model, response_format=None, logprobs=False, max_completion_tokens=None):
         return _fake_response({"שנה": "not-a-number"})
 
     monkeypatch.setattr(llm_fallback_service.OpenAIRepository, "chat", staticmethod(fake_chat))
@@ -93,7 +93,7 @@ async def test_both_tiers_fail_validation_degrades_to_rule_path(monkeypatch):
 async def test_tier1_api_error_escalates_to_tier2(monkeypatch):
     calls = []
 
-    async def fake_chat(messages, model, response_format=None, logprobs=False):
+    async def fake_chat(messages, model, response_format=None, logprobs=False, max_completion_tokens=None):
         calls.append(model)
         if model == settings.openai_fallback_model:
             raise OpenAIUnavailableError("missing api key")
@@ -108,7 +108,7 @@ async def test_tier1_api_error_escalates_to_tier2(monkeypatch):
 
 
 async def test_tier2_api_error_degrades(monkeypatch):
-    async def fake_chat(messages, model, response_format=None, logprobs=False):
+    async def fake_chat(messages, model, response_format=None, logprobs=False, max_completion_tokens=None):
         raise OpenAIUnavailableError("no key configured")
 
     monkeypatch.setattr(llm_fallback_service.OpenAIRepository, "chat", staticmethod(fake_chat))

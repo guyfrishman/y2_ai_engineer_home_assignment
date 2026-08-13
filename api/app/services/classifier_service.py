@@ -6,7 +6,6 @@ by ``extractor_service`` — no need to re-scan the query a second time."""
 import re
 from dataclasses import dataclass
 
-from app.logger import log_activity
 from app.repositories.taxonomy_repository import taxonomy_repository
 from app.schema.taxonomy_models import Vertical
 from app.services.normalizer_service import HEBREW_STOPWORDS
@@ -107,7 +106,6 @@ def _margin_factor(scores: dict[Vertical, int]) -> float:
     return MARGIN_FACTOR_MIN + (MARGIN_FACTOR_MAX - MARGIN_FACTOR_MIN) * margin
 
 
-@log_activity
 def classify_query(canonical_query: str) -> ClassificationResult:
     """Pick the vertical with the strongest taxonomy-term coverage and score
     a rule-path confidence for that pick.

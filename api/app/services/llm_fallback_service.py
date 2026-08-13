@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from pydantic import BaseModel, ValidationError
 
 from app.config import settings
-from app.logger import log_activity, log_metric
+from app.logger import log_event
 from app.metrics import PARSE_MODEL_CALLS_TOTAL
 from app.prompts.system_prompts import build_extraction_system_prompt
 from app.repositories.openai_repository import OpenAIRepository, OpenAIUnavailableError
@@ -29,6 +29,13 @@ from app.services.llm_confidence_service import compute_llm_confidence
 # so this is an honest fixed "unknown," not a measurement.
 DEGRADED_CONFIDENCE = 0.15
 DEGRADED_NOTE = "low-confidence extraction — model fallback did not produce a valid result"
+
+# A full-schema, mostly-null response tops out around 190-230 completion
+# tokens in measurement (see docs/infrastructure/latency-investigation.md).
+# This is a safety bound against a pathological runaway generation, not a
+# tuning lever for the normal case — it's comfortably above anything a
+# correct response needs.
+MAX_FALLBACK_COMPLETION_TOKENS = 400
 
 
 @dataclass
@@ -106,10 +113,14 @@ async def _call_tier(
 
     try:
         response = await OpenAIRepository.chat(
-            messages, model=model_name, response_format=response_format, logprobs=True
+            messages,
+            model=model_name,
+            response_format=response_format,
+            logprobs=True,
+            max_completion_tokens=MAX_FALLBACK_COMPLETION_TOKENS,
         )
     except OpenAIUnavailableError as error:
-        log_metric(event="security_llm_validation_failed", tier=tier_label, outcome="api_error", reason=str(error))
+        log_event(event="security_llm_validation_failed", tier=tier_label, outcome="api_error", reason=str(error))
         PARSE_MODEL_CALLS_TOTAL.labels(tier=tier_label, outcome="api_error").inc()
         return None, None
 
@@ -117,14 +128,14 @@ async def _call_tier(
     try:
         raw_params = json.loads(raw_content)
     except json.JSONDecodeError:
-        log_metric(event="security_llm_validation_failed", tier=tier_label, outcome="validation_failed", reason="invalid_json")
+        log_event(event="security_llm_validation_failed", tier=tier_label, outcome="validation_failed", reason="invalid_json")
         PARSE_MODEL_CALLS_TOTAL.labels(tier=tier_label, outcome="validation_failed").inc()
         return None, None
 
     try:
         validated_params = model_class(**raw_params)
     except ValidationError as error:
-        log_metric(
+        log_event(
             event="security_llm_validation_failed",
             tier=tier_label,
             outcome="validation_failed",
@@ -133,13 +144,12 @@ async def _call_tier(
         PARSE_MODEL_CALLS_TOTAL.labels(tier=tier_label, outcome="validation_failed").inc()
         return None, None
 
-    log_metric(event="llm_call_outcome", tier=tier_label, outcome="success", model=model_name)
+    log_event(event="llm_call_outcome", tier=tier_label, outcome="success", model=model_name)
     PARSE_MODEL_CALLS_TOTAL.labels(tier=tier_label, outcome="success").inc()
     token_logprobs = response.choices[0].logprobs.content if response.choices[0].logprobs else []
     return validated_params, token_logprobs
 
 
-@log_activity
 async def run_llm_fallback(
     vertical: Vertical, canonical_query: str, rule_path_params: BaseModel
 ) -> LlmFallbackResult:

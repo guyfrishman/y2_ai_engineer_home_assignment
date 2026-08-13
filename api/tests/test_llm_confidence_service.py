@@ -73,10 +73,14 @@ async def test_compute_llm_confidence_falls_back_to_logprob_only_when_embedding_
 
     monkeypatch.setattr(llm_confidence_service.OpenAIRepository, "embed", staticmethod(failing_embed))
 
+    # certain_logprob=-0.3 -> exp(-0.3)=~0.74, deliberately mid-range (not
+    # decisive) so this exercises the embedding-call-then-fallback path,
+    # not the skip-when-decisive short-circuit tested separately below.
     json_text = json.dumps({"מחיר": 100}, ensure_ascii=False)
-    tokens = _fabricate_tokens(json_text, uncertain_substrings=[])
+    tokens = _fabricate_tokens(json_text, uncertain_substrings=[], certain_logprob=-0.3)
     confidence = await compute_llm_confidence("דירה", tokens, ["מחיר"], {"מחיר": 100})
     logprob_only = compute_logprob_confidence(tokens, ["מחיר"])
+    assert llm_confidence_service.DECISIVE_LOW_THRESHOLD < logprob_only < llm_confidence_service.DECISIVE_HIGH_THRESHOLD
     assert confidence == round(logprob_only, 10) or abs(confidence - logprob_only) < 1e-9
 
 
@@ -85,7 +89,48 @@ async def test_confidence_is_clamped_to_unit_interval(monkeypatch):
         return [1.0, 0.0]
 
     monkeypatch.setattr(llm_confidence_service.OpenAIRepository, "embed", staticmethod(fake_embed))
+    # Mid-range logprob (not decisive), so blending actually runs.
     json_text = json.dumps({"מחיר": 100}, ensure_ascii=False)
-    tokens = _fabricate_tokens(json_text, uncertain_substrings=[], certain_logprob=0.0)
+    tokens = _fabricate_tokens(json_text, uncertain_substrings=[], certain_logprob=-0.3)
     confidence = await compute_llm_confidence("דירה", tokens, ["מחיר"], {"מחיר": 100})
     assert 0.0 <= confidence <= 1.0
+
+
+async def test_decisive_high_logprob_skips_embedding_call(monkeypatch):
+    call_count = {"n": 0}
+
+    async def fake_embed(text, model=None):
+        call_count["n"] += 1
+        return [1.0, 0.0]
+
+    monkeypatch.setattr(llm_confidence_service.OpenAIRepository, "embed", staticmethod(fake_embed))
+    # certain_logprob=-0.01 -> exp(-0.01)=~0.99, comfortably above
+    # DECISIVE_HIGH_THRESHOLD.
+    json_text = json.dumps({"מחיר": 100}, ensure_ascii=False)
+    tokens = _fabricate_tokens(json_text, uncertain_substrings=[], certain_logprob=-0.01)
+    logprob_only = compute_logprob_confidence(tokens, ["מחיר"])
+    assert logprob_only >= llm_confidence_service.DECISIVE_HIGH_THRESHOLD
+
+    confidence = await compute_llm_confidence("דירה", tokens, ["מחיר"], {"מחיר": 100})
+    assert confidence == logprob_only
+    assert call_count["n"] == 0  # embedding never called -- skipped as decisive
+
+
+async def test_decisive_low_logprob_skips_embedding_call(monkeypatch):
+    call_count = {"n": 0}
+
+    async def fake_embed(text, model=None):
+        call_count["n"] += 1
+        return [1.0, 0.0]
+
+    monkeypatch.setattr(llm_confidence_service.OpenAIRepository, "embed", staticmethod(fake_embed))
+    # certain_logprob=-5.0 -> exp(-5.0)=~0.0067, comfortably below
+    # DECISIVE_LOW_THRESHOLD.
+    json_text = json.dumps({"מחיר": 100}, ensure_ascii=False)
+    tokens = _fabricate_tokens(json_text, uncertain_substrings=[], certain_logprob=-5.0)
+    logprob_only = compute_logprob_confidence(tokens, ["מחיר"])
+    assert logprob_only <= llm_confidence_service.DECISIVE_LOW_THRESHOLD
+
+    confidence = await compute_llm_confidence("דירה", tokens, ["מחיר"], {"מחיר": 100})
+    assert confidence == logprob_only
+    assert call_count["n"] == 0

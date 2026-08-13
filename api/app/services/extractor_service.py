@@ -9,7 +9,6 @@ from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
-from app.logger import log_activity
 from app.repositories.taxonomy_repository import taxonomy_repository
 from app.schema.taxonomy_models import Vertical
 from app.services.classifier_service import TermOccurrence
@@ -137,7 +136,6 @@ REAL_ESTATE_ENUM_FIELDS = (
 )
 
 
-@log_activity
 def extract_real_estate_params(canonical_query: str, occurrences: list[TermOccurrence]) -> BaseModel:
     params: dict[str, Any] = {}
     working_text = canonical_query
@@ -177,7 +175,6 @@ def extract_real_estate_params(canonical_query: str, occurrences: list[TermOccur
     return _validate(taxonomy_repository.params_models[Vertical.REAL_ESTATE], params)
 
 
-@log_activity
 def extract_vehicle_params(canonical_query: str, occurrences: list[TermOccurrence]) -> BaseModel:
     params: dict[str, Any] = {}
     working_text = canonical_query
@@ -231,7 +228,6 @@ def extract_vehicle_params(canonical_query: str, occurrences: list[TermOccurrenc
     return _validate(taxonomy_repository.params_models[Vertical.VEHICLES], params)
 
 
-@log_activity
 def extract_used_goods_params(canonical_query: str, occurrences: list[TermOccurrence]) -> BaseModel:
     params: dict[str, Any] = {}
     working_text = canonical_query

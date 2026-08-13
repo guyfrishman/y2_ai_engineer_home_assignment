@@ -14,6 +14,7 @@ class Settings(BaseSettings):
 
     # Logging
     log_level: str = "INFO"
+    max_str_log_length: int = 200
 
     # Auth — when empty, API key auth is a no-op (open, for local dev/grading)
     api_access_key: str = ""
