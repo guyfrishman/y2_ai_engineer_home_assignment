@@ -30,8 +30,13 @@ def test_clean_unambiguous_vehicle_query_has_high_confidence():
     # score well above the confidence threshold and skip the LLM fallback.
     # Asserted against the real threshold, not a literal that could drift
     # out of sync with it and silently stop testing the claim this test's
-    # name and comment actually make.
-    result = _classify("מאזדה CX-5 שנת 2020")
+    # name and comment actually make. Deliberately "2020", not "שנת 2020":
+    # "שנת" (construct-state "year of") is a real, taxonomy-derived
+    # יד_שנייה cue word too (from the "שנת_ייצור" field name split) -- the
+    # bare year alone still extracts fine (extractor_service's year regex
+    # doesn't need the word "שנת" at all), without introducing that
+    # cross-vertical competition into what this test means to keep clean.
+    result = _classify("מאזדה CX-5 2020")
     assert result.confidence >= settings.confidence_threshold
 
 
@@ -85,3 +90,41 @@ def test_numbers_still_count_once_a_real_term_match_gives_them_context():
     # every golden example already relies on.
     result = _classify("טויוטה 2018 2019 2020")
     assert result.confidence > 0.3
+
+
+def test_bait_alone_signals_real_estate_without_villa():
+    # "בית פרטי/וילה" is one literal taxonomy string -- bare "בית" ("house")
+    # used to match nothing at all. Now derived as a real-estate cue word
+    # (TaxonomyRepository._build_cue_words, Rule C), not hand-added.
+    result = _classify("בית גדול ונעים")
+    assert result.vertical == Vertical.REAL_ESTATE
+    assert result.confidence > 0.0
+
+
+def test_for_sale_phrasing_no_longer_tips_ambiguously_toward_used_goods():
+    # "למכירה"/"מכירה" are transaction words ambiguous across all three
+    # verticals (a car or an apartment is also "for sale") -- and "מכירה"
+    # is literally a real-estate מצבי_עסקה term. A used-goods-only cue word
+    # for it used to fight the real-estate signal on exactly this kind of
+    # query.
+    result = _classify("דירה למכירה בחיפה")
+    assert result.vertical == Vertical.REAL_ESTATE
+
+
+def test_vehicle_type_words_shared_with_other_verticals_are_a_real_tie():
+    # Disclosed, not fixed: "מסחרי" ("commercial") is literally both a
+    # vehicles סוגי_רכב value *and* a real-estate מצבי_עסקה value -- the
+    # taxonomy itself makes this word genuinely ambiguous, not a gap in cue-
+    # word derivation. Scored as a real 1-1 tie (see margin_factor); the
+    # tie-break still favors Vertical.REAL_ESTATE (declared first), same as
+    # the zero-confidence default -- but this is a *scored* tie with real
+    # partial signal (confidence > 0), which is exactly why item 1's
+    # zero-signal-only gate (confidence == 0.0 precisely) doesn't -- and
+    # shouldn't -- catch it: routing every non-zero tie through an LLM call
+    # would defeat the rule path's entire cost advantage for a case this
+    # taxonomy-inherent. A query that actually needs "מסחרי" disambiguated
+    # resolves correctly once paired with a real signal either way, e.g.
+    # "רכב מסחרי" (see test_taxonomy_generated_classification.py).
+    result = _classify("מסחרי עד 100000 שח")
+    assert result.vertical == Vertical.REAL_ESTATE  # the tie-break, documented
+    assert 0.0 < result.confidence < 0.5  # genuinely low, not confidently wrong

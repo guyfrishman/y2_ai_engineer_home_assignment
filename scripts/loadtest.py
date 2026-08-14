@@ -34,15 +34,15 @@ LLM_P95_TARGET_SECONDS = 0.600
 # low-confidence/ambiguous queries (trigger the LLM fallback tier).
 CACHE_QUERY = "טויוטה קורולה 2018-2021 עד 70 אלף שח צבע לבן"
 RULES_PATH_QUERIES = [
-    "מאזדה CX-5 שנת 2020",
+    "מאזדה CX-5 2020",
     "יונדאי טוסון 2019 בעלות פרטי",
-    "קיה ספורטאז' שנת 2021 גיר אוטומטית",
+    "קיה ספורטאז' 2021 גיר אוטומטית",
     "מרצדס C-Class 2018 דיזל",
     "טסלה Model 3 2022 חשמלי",
 ]
 LLM_PATH_QUERIES = [
-    "דירת 3 חדרים בירושלים עד מליון שח",
-    "אייפון 13 פרו 256 גיגה כחול כמו חדש עד 2500",
+    "דירה בירושלים עד מיליון שח",
+    "אייפון 13 פרו",
     "וילה יפה עם גינה גדולה",
     "משהו נחמד למכירה בזול",
 ]
@@ -98,16 +98,20 @@ def _build_query_plan(total_requests: int) -> list[str]:
     return plan[:total_requests]
 
 
-# "דירת" (construct form) never matches the taxonomy's "דירה" -- a documented
-# confidence gap (see docs/infrastructure/confidence-calibration.md) that
-# reliably keeps every generated variant below confidence_threshold regardless
-# of room count/city/price (verified: 30/30 sampled below 0.58). Used only by
-# --llm-ratio below, where a sustained target ratio needs many distinct
-# LLM-triggering queries -- cycling the fixed 4-query LLM_PATH_QUERIES pool
-# collapses into cache hits (and, with in-flight coalescing, a single shared
-# call) after the first occurrence of each, so it can't sustain a requested
-# ratio of real fallback traffic over a long run.
-_LOW_CONFIDENCE_CITIES = ["ירושלים", "תל אביב", "חיפה", "באר שבע", "נתניה", "אשדוד", "ראשון לציון", "פתח תקווה"]
+# "דירת" (construct form) never matches the taxonomy's "דירה", so this alone
+# doesn't earn real-estate coverage credit -- but the taxonomy DOES index a
+# handful of city names as exact terms/cue words (docs/DESIGN.md), and a
+# generated query using one of those cities can clear confidence_threshold
+# on city+room-count credit alone. Deliberately cities *not* in the
+# taxonomy's own examples list (see data/taxonomy.json's עיר.דוגמאות), so
+# every generated variant reliably stays below threshold regardless of room
+# count/price (verified: 30/30 sampled below 0.58). Used only by --llm-ratio
+# below, where a sustained target ratio needs many distinct LLM-triggering
+# queries -- cycling the fixed 4-query LLM_PATH_QUERIES pool collapses into
+# cache hits (and, with in-flight coalescing, a single shared call) after
+# the first occurrence of each, so it can't sustain a requested ratio of
+# real fallback traffic over a long run.
+_LOW_CONFIDENCE_CITIES = ["נתניה", "אשדוד", "ראשון לציון", "פתח תקווה", "הרצליה", "רעננה", "כפר סבא", "מודיעין"]
 _LOW_CONFIDENCE_ROOM_COUNTS = [1, 2, 3, 4, 5]
 _LOW_CONFIDENCE_PRICE_CEILINGS = [600000, 900000, 1200000, 1500000, 1800000]
 
@@ -125,10 +129,9 @@ def _generate_low_confidence_queries(count: int) -> list[str]:
 def _build_query_plan_with_llm_ratio(total_requests: int, llm_ratio: float) -> list[str]:
     """Same cache/rules/llm shape as _build_query_plan, but with the LLM-path
     share held at an explicit target ratio via distinct generated queries,
-    for controlled concurrency-vs-ratio comparisons (see
-    docs/infrastructure/latency-investigation.md's queueing-hypothesis
-    section). Deterministically shuffled so repeated runs at the same
-    parameters are comparable."""
+    for controlled concurrency-vs-ratio comparisons (see docs/DESIGN.md's
+    Latency section). Deterministically shuffled so repeated runs at the
+    same parameters are comparable."""
     llm_count = round(total_requests * llm_ratio)
     other_count = total_requests - llm_count
     llm_queries = _generate_low_confidence_queries(llm_count)
@@ -151,8 +154,8 @@ async def _warm_up_connection_pool(client: httpx.AsyncClient, concurrency: int) 
     Without this, the first ~`concurrency` requests of any run pay a
     one-time cost to open that many new TCP connections at once -- measured
     at 200-290ms per request in this project's investigation (see
-    docs/infrastructure/latency-investigation.md's connection-pool-warmup
-    finding), entirely unrelated to request handling. Every prior loadtest
+    docs/DESIGN.md's Latency section), entirely unrelated to request
+    handling. Every prior loadtest
     run created a fresh httpx.AsyncClient (cold pool) *and* usually hit a
     freshly-restarted server, so this cost was silently re-measured as if
     it were a real cache/rules p95 SLA violation on every single run. A real

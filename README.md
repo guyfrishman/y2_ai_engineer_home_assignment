@@ -4,12 +4,13 @@ A FastAPI service that converts a Hebrew free-text marketplace query
 (`"דירת 3 חדרים בירושלים עד מליון שח"`) into structured, taxonomy-validated
 search parameters for one of three Yad2 verticals (נדל״ן / רכב / יד_שנייה).
 A rule/dictionary classifier and extractor handle the majority of traffic
-at zero marginal cost and sub-150ms latency; a two-tier OpenAI cascade —
-cheap model first, escalating only on validation failure, degrading
-gracefully rather than failing if that's unavailable — covers the queries
-rules genuinely can't resolve. Every field either path can emit comes
-straight out of `spec/yad2_search_taxonomy.json`, dynamically, so there is
-no code path that can invent a field outside the taxonomy.
+at zero marginal cost; a two-tier OpenAI cascade — cheap model first,
+escalating only on validation failure, degrading gracefully rather than
+failing if that's unavailable — covers what rules genuinely can't resolve,
+including a dedicated classify-only call for queries with zero taxonomy
+signal at all. Every field either path can emit comes straight out of
+`data/taxonomy.json`, dynamically, so no code path can invent a field
+outside the taxonomy.
 
 ## Pipeline
 
@@ -20,44 +21,45 @@ POST /parse  { "q": "<Hebrew free text>" }
 sanitize (emoji/control chars/length)
    │
    ▼
-normalize (units, ranges, typo+fuzzy correction)
+normalize (units, ranges, currency slang, typo+fuzzy correction)
    │
    ▼
-cache lookup ──hit──────────────────────────────────► return  (p95  55ms measured)
+cache lookup ──hit────────────────────────────────────► return
    │ miss
    ▼
-identical request already in flight? ──yes──► await it, return  (path="coalesced")
+identical request already in flight? ──yes──► await it, return
    │ no
    ▼
 rule/dictionary classify + extract
    │
-   ▼
-confidence >= 0.58? ──yes──► validate ─► cache write ─► return  (p95  41ms measured)
-   │ no
-   ▼
-OpenAI Tier 1 (gpt-4.1-nano, cheap)      (avg 2.6s uncontended — see below)
+   ├─ confidence >= 0.58 ──────────────► validate ─► cache write ─► return
    │
-   ├─ success ──────────────────────────────────────► validate ─► cache write ─► return
-   │
-   └─ validation failure / api_error  (17% of fallback calls, measured)
+   ├─ 0 < confidence < 0.58 (partial signal, a real hint)
+   │        │
+   │        ▼
+   └─ confidence == 0.0 (zero signal) ─► classify-only LLM call ─► degrade honestly on failure
+            │
+            ▼
+      OpenAI Tier 1 (gpt-4.1-nano, cheap)
         │
-        ▼
-      OpenAI Tier 2 (gpt-4.1-mini, stronger)
-        │
-        ├─ success ────────────────────────────────► validate ─► cache write ─► return
+        ├─ success ──────────────────────────────────► validate ─► cache write ─► return
         │
         └─ validation failure / api_error
              │
              ▼
-           degrade to rule path's own result, confidence=0.15, notes flag
+           OpenAI Tier 2 (gpt-4.1-mini, stronger)
+             │
+             ├─ success ────────────────────────────► validate ─► cache write ─► return
+             │
+             └─ validation failure / api_error
+                  │
+                  ▼
+                degrade to rule path's own result, confidence=0.15, notes flag
 ```
 
-Confidence is *measured*, not asserted, on every path: rule-path confidence
-is taxonomy-term coverage scaled by classification margin; a successful
-LLM tier's confidence blends the completion's own value-token logprobs
-with an embedding cross-check; only the final degrade uses a fixed
-constant, because there's genuinely nothing to measure there. Full
-rationale: [`docs/decisions/0001-hybrid-rule-first-llm-fallback-pipeline.md`](docs/decisions/0001-hybrid-rule-first-llm-fallback-pipeline.md).
+Confidence is measured, not asserted, on every path — see
+[`docs/DESIGN.md`](docs/DESIGN.md) for the full formulas, the zero-signal
+classification fix, and known disclosed limitations.
 
 ## Quickstart
 
@@ -83,82 +85,40 @@ curl http://localhost:8000/metrics
 ```
 
 ```bash
-cd y2_ai_search_api && uv run pytest                                              # 103 tests, no network, ~1.5s
+cd y2_ai_search_api && uv run pytest                                             # no network required
 cd y2_ai_search_api && uv run python ../scripts/loadtest.py --requests 200 --concurrency 20
 ```
 
-## The honest finding: the model-path latency target isn't met
+## Latency
 
-Cache/rules p95 passes (≤150ms) at steady state, but **a fresh, cold
-client hitting a freshly-started instance can see 200-700ms on its first
-burst of concurrent traffic** — narrowed, with the root mechanism now
-honestly reported as still open, not resolved. Eight candidates were
-ruled out across two investigation rounds (`@log_activity`, the
-classifier's taxonomy scan, the LLM-confidence logprob computation —
-profiled with real captured completions, sub-millisecond — CPU/memory
-saturation, uvicorn tuning, connection-pool sizing, 3x replica capacity). A minimal
-zero-app-code control test (bare FastAPI, one instant route, one
-`asyncio.sleep` route), run natively on Windows, reproduced a matching
-pattern and was initially reported as the resolved cause — a mistake
-caught by reconciling it against this investigation's own earlier data:
-the same minimal app, run inside Docker the way the real app actually
-runs, does **not** reproduce the effect at all, whether the slow route
-is a synthetic sleep, a real outbound call to OpenAI, or that call with
-Prometheus instrumentation added. The native-Windows mechanism is real
-but doesn't explain the Dockerized deployment. What's still true and
-unaffected by that correction: a cold client against the real
-application really does show elevated latency that a warm client,
-immediately after, does not — reproducible, just not yet root-caused.
-`scripts/loadtest.py` still warms its connection pool before timing (a
-reasonable practice regardless of the exact mechanism); a real deployment
-should still warm each code path at startup as a mitigation, described
-honestly as that rather than as a fix for a fully-understood cause. Full
-reconciliation and every number:
-`docs/infrastructure/latency-investigation.md`. The 600ms
-model-path target fails outright —
-measured p95 well into multi-second territory against the real API, root
-caused (not just observed): Structured Outputs strict mode forces every
-optional field into the response as an explicit `null`, so a 20-28-field
-taxonomy schema costs ~2-3s of real generation time per call regardless of
-how few fields the query actually needs. A controlled experiment
-confirmed the direction (dropping strict mode cut latency 56%) and why
-it's not adopted (validation collapsed to 12% — this nano-tier model
-doesn't reliably reproduce correct Hebrew object keys without constrained
-decoding); a follow-up comparison against GPT-5-nano/mini confirmed the
-current model choice is still the best measured option. Full diagnosis,
-every number, and the write-behind architecture recommended as the real
-next step: **[`docs/requirements.md`](docs/requirements.md)**.
+| Path | Measured |
+|---|---|
+| Cache hit | p95 ~55ms |
+| Rules | p95 ~41ms |
+| LLM fallback (Tier 1, uncontended) | avg ~2.6s — misses the 600ms target |
+| Zero-signal classify + Tier 1 + confidence cross-check | ~6.0s (live example, `docs/examples.md` #9) |
 
-This is on the front page deliberately — a README that only shows the
-numbers that pass isn't a credible one.
+Root cause of the 600ms miss: Structured Outputs strict mode forces every
+optional field in a 20-28-field taxonomy schema into the response as an
+explicit `null`, regardless of how few fields the query needs — confirmed
+by a controlled experiment (dropping strict mode cut latency 56% but
+collapsed Hebrew-key validity from 100% to 12%, so it's rejected on
+correctness grounds). Full diagnosis and every number: [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## Cost model
 
-Real measured tokens (4 live Tier 1 calls, `gpt-4.1-nano`): **3,323.5 avg
-prompt tokens, 191.2 avg completion tokens** per fallback call. At
-verified pricing, **$0.000410/request** for a Tier-1-only fallback,
-**~$0.000655/request** blended at a conservative 15% Tier-2 rate.
-
-| Scenario | Cache hit | Monthly cost (10M queries) | $/request |
-|---|---|---|---|
-| Conservative | 20% | $2,096 | $0.00021 |
-| Optimistic | 60% | $917 | $0.00009 |
-
-Even the conservative scenario is ~$2,100/month for 10M queries, because
-caching and the rule-first classifier mean the LLM only ever touches the
-minority of traffic. Levers implemented: full-response + word-level
-normalization caching, in-flight request coalescing (N concurrent identical
-requests pay for one LLM call, not N), the rule-first classifier itself,
-two-tier escalation. Full breakdown and what's discussed-but-not-implemented
-(OpenAI prompt caching, embeddings-vs-rules): [`docs/infrastructure/cost-model.md`](docs/infrastructure/cost-model.md).
+Real measured tokens (Tier 1, `gpt-4.1-nano`): 3,323.5 avg prompt tokens,
+191.2 avg completion tokens per fallback call. **$0.000410/request**
+Tier-1-only, **~$0.000655/request** blended at a conservative 15% Tier-2
+rate. Even a conservative 20%-cache-hit scenario projects to ~$2,100/month
+at 10M queries. Full breakdown: [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## Docs
 
-- [`docs/onboarding.md`](docs/onboarding.md) — mental model, 5-minute run
-- [`docs/requirements.md`](docs/requirements.md) — full functional/non-functional requirement tables + the complete latency diagnosis
-- [`docs/AGENTS.md`](docs/AGENTS.md) · [`docs/conventions/`](docs/conventions/) — how this repo is built and why
-- [`docs/decisions/`](docs/decisions/) — the ADRs behind this design
-- [`docs/services/search-api.md`](docs/services/search-api.md) — service reference, including known quirks
-- [`docs/infrastructure/`](docs/infrastructure/) — observability, cost model, confidence calibration, latency investigation
-- [`docs/examples.md`](docs/examples.md) — 8 worked examples across all 3 verticals
-- [`INSTRUCTIONS.md`](INSTRUCTIONS.md) — the original assignment brief, untouched
+- [`docs/DESIGN.md`](docs/DESIGN.md) — pipeline rationale, the zero-signal
+  classification fix, confidence methodology, cost model, latency
+  diagnosis, known disclosed limitations, future directions
+- [`docs/examples.md`](docs/examples.md) — 9 worked examples across all 3
+  verticals, including a live end-to-end run of the zero-signal fix
+- [`INSTRUCTIONS.md`](INSTRUCTIONS.md) — the original assignment brief,
+  untouched

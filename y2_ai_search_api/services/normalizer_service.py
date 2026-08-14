@@ -9,23 +9,12 @@ import re
 
 from rapidfuzz import fuzz, process
 
-from repositories.taxonomy_repository import taxonomy_repository
+from repositories.taxonomy_repository import HEBREW_STOPWORDS, taxonomy_repository
+from text_normalization import build_mark_tolerant_alternation, build_mark_tolerant_pattern
 
 WORD_CORRECTION_CACHE_SIZE = 8192
 FUZZY_MATCH_MIN_SCORE = 85  # rapidfuzz 0-100 similarity; below this, leave the word as-is
 MIN_WORD_LENGTH_FOR_CORRECTION = 3  # shorter words (prepositions, "עד", "בן") fuzzy-match unreliably
-
-# Common Hebrew function words, excluded from typo correction (too short/
-# ambiguous to fuzzy-match safely) and from the classifier's token-coverage
-# scoring (see classifier_service.py) — they carry no vertical signal.
-HEBREW_STOPWORDS = frozenset(
-    {
-        "עם", "בלי", "של", "על", "אל", "עד", "מן", "מ", "ב", "כ", "ל", "ה",
-        "ו", "או", "גם", "רק", "כל", "זה", "זו", "אלה", "יש", "אין", "לא",
-        "כן", "אני", "אתה", "את", "הוא", "היא", "אנחנו", "הם", "הן", "אבל",
-        "אז", "כי", "פה", "שם", "בין", "לפי", "עבור", "אחרי", "לפני",
-    }
-)
 
 _THOUSAND_MULTIPLIER = 1_000
 _MILLION_MULTIPLIER = 1_000_000
@@ -48,8 +37,42 @@ _BARE_MAGNITUDE_PATTERN = re.compile(
 
 _BETWEEN_PHRASE_PATTERN = re.compile(r"בין\s+(?P<low>\d+)\s*(?:ל-?|עד)\s*(?P<high>\d+)")
 
-_CURRENCY_WORD_PATTERN = re.compile(r"(ש\"ח|ש״ח|שקלים|שקל|שח|₪)")
+_CURRENCY_WORD_PATTERN = re.compile(
+    # Word-bounded on both sides -- (?<!\w)/(?!\w), not (?<!\S)/(?!\S), so a
+    # currency word directly followed by punctuation ("שח.", "שח,") still
+    # matches. Without *some* trailing boundary, the mark-tolerant "ש״ח"
+    # pattern (tolerant of *zero* marks) degenerates to a bare "שח"
+    # substring match anywhere in the text, including inside unrelated
+    # words like "שחור" (black) or "משחק" (game). Confirmed reproducible
+    # pre-existing behavior even before mark-tolerance (the original
+    # pattern's own literal "שח" alternative already matched "שחור"'s
+    # first two letters) -- fixed here since it's the same root cause.
+    #
+    # ₪ is deliberately its OWN, unbounded alternative, not inside the
+    # word-boundary group: it's a currency *symbol*, not a letter sequence,
+    # so it has none of the above substring-collision risk, and it's
+    # routinely written glued directly to a digit ("100₪") -- a real,
+    # common case a word boundary would otherwise reject.
+    r"(?<!\w)(?:" + build_mark_tolerant_alternation("ש״ח", "שקלים", "שקל", "שח") + r")(?!\w)|₪"
+)
 _CURRENCY_CANONICAL_FORM = "ש״ח"
+
+# "אש״ח" (אלף ש״ח, thousand NIS) — numeric-language grammar, same category
+# as _MAGNITUDE_WORD_MULTIPLIERS above, not taxonomy vocabulary, so it's a
+# small hardcoded set like that one, not something derived from the
+# taxonomy. Mark-tolerant so "אש\"ח"/"אש''ח"/"אש״ח" all expand the same way.
+# Multiplies *and* emits the canonical currency word, feeding the exact same
+# _extract_price/_CURRENCY_UNIT_PATTERN path in extractor_service.py as a
+# plain "20000 ש״ח" would — no extraction-side change needed. Must run
+# before _canonicalize_currency_words, which would otherwise partially
+# match the "ש״ח" tail inside "אש״ח" and leave a stray "א" behind.
+_THOUSAND_SHEKEL_PATTERN = re.compile(
+    r"(?P<number>\d+(?:\.\d+)?)\s*" + build_mark_tolerant_pattern("אש״ח") + r"(?!\w)"
+)
+# "10k"/"10K" -> "10000": a bare numeric-magnitude suffix, same mechanism as
+# _MAGNITUDE_WORD_MULTIPLIERS. The negative lookahead excludes a unit like
+# "50kg" ("k" here is part of a different unit, not a magnitude suffix).
+_K_SUFFIX_PATTERN = re.compile(r"(?P<number>\d+(?:\.\d+)?)[kK](?![a-zA-Zא-ת])")
 
 _NUMERIC_TOKEN_PATTERN = re.compile(r"^[\d\-.,]+$")
 _WORD_EDGE_PUNCTUATION = ",.!?;:"
@@ -68,6 +91,29 @@ def _expand_magnitude_words(text: str) -> str:
     text = _NUMBER_THEN_MAGNITUDE_PATTERN.sub(replace_number_and_magnitude, text)
     text = _BARE_MAGNITUDE_PATTERN.sub(replace_bare_magnitude, text)
     return text
+
+
+def _expand_thousand_shekel_abbreviation(text: str) -> str:
+    """Rewrite "20 אש״ח" -> "20000 ש״ח" (any mark variant of אש״ח) — feeds
+    the same _extract_price/_CURRENCY_UNIT_PATTERN path as a plain "20000
+    ש״ח" would. Must run before _canonicalize_currency_words, which would
+    otherwise partially match the "ש״ח" tail inside "אש״ח" and leave a
+    stray "א" behind.
+    """
+
+    def replace(match: re.Match[str]) -> str:
+        return f"{int(float(match.group('number')) * _THOUSAND_MULTIPLIER)} {_CURRENCY_CANONICAL_FORM}"
+
+    return _THOUSAND_SHEKEL_PATTERN.sub(replace, text)
+
+
+def _expand_k_suffix(text: str) -> str:
+    """Rewrite "10k"/"10K" -> "10000"."""
+
+    def replace(match: re.Match[str]) -> str:
+        return str(int(float(match.group("number")) * _THOUSAND_MULTIPLIER))
+
+    return _K_SUFFIX_PATTERN.sub(replace, text)
 
 
 def _rewrite_between_phrases_as_dash_ranges(text: str) -> str:
@@ -155,11 +201,13 @@ def _should_correct(word: str) -> bool:
 
 
 def normalize_query(sanitized_query: str) -> str:
-    """Produce the canonical query string: magnitude words and currency
-    words expanded/canonicalized, between-phrases rewritten as dashed
-    ranges, and each eligible word typo-corrected.
+    """Produce the canonical query string: financial-slang and magnitude
+    words expanded, currency canonicalized, between-phrases rewritten as
+    dashed ranges, and each eligible word typo-corrected.
     """
-    text = _expand_magnitude_words(sanitized_query)
+    text = _expand_thousand_shekel_abbreviation(sanitized_query)
+    text = _expand_k_suffix(text)
+    text = _expand_magnitude_words(text)
     text = _rewrite_between_phrases_as_dash_ranges(text)
     text = _canonicalize_currency_words(text)
 

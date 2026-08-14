@@ -1,8 +1,11 @@
 """OpenAI-specific client — not a provider-agnostic abstraction. This
 service only ever calls OpenAI (the brief pins the provider), so the class
-is named and shaped for that rather than carrying a base-URL-swappable
-LlmRepository interface it would never use. See
-docs/decisions/0002-openai-specific-repository.md.
+is named and shaped for that rather than carrying a base-URL-swappable,
+multi-provider interface it would never use: Structured Outputs strict-mode
+JSON schemas and per-token logprobs (used directly for the measured
+LLM-tier confidence score) aren't universally supported the same way across
+OpenAI-compatible endpoints, and a name promising provider flexibility the
+implementation doesn't deliver would be dishonest.
 
 Async client, not sync: the LLM-fallback path is the only part of this
 service with real network I/O, and it must not block the event loop while
@@ -12,6 +15,8 @@ cheap, CPU-bound rule/cache path stays plain synchronous code (Python's GIL
 means threading it would add overhead with no real parallelism); only this
 network-bound edge needs asyncio.
 """
+
+import time
 
 import httpx2
 from openai import AsyncOpenAI
@@ -32,10 +37,9 @@ Message = dict[str, str]
 OPENAI_REQUEST_TIMEOUT_SECONDS = 5.0
 OPENAI_MAX_RETRIES = 0
 
-# Checked directly, not assumed (see
-# docs/infrastructure/latency-investigation.md's connection-pool section):
-# openai-python 3.x already configures a far more generous pool than bare
-# httpx's own defaults would suggest — openai._constants.DEFAULT_CONNECTION_LIMITS
+# Checked directly, not assumed: openai-python 3.x already configures a far
+# more generous pool than bare httpx's own defaults would suggest —
+# openai._constants.DEFAULT_CONNECTION_LIMITS
 # is max_connections=1000, max_keepalive_connections=100 on its vendored
 # httpx2 transport, not httpx's commonly-cited 100/20. This service's own
 # concurrency never approaches even the SDK's default, so this doubling is
@@ -84,10 +88,9 @@ class OpenAIRepository:
         completion text.
 
         ``reasoning_effort`` is GPT-5-family-specific (e.g. "minimal") and
-        unused by production code today — added for the model-comparison
-        experiment in docs/infrastructure/latency-investigation.md, kept as
-        an optional parameter rather than a special case so a future
-        decision to adopt a GPT-5 model doesn't need another signature change.
+        unused by production code today — kept as an optional parameter
+        rather than a special case so a future decision to adopt a GPT-5
+        model doesn't need another signature change.
         """
         if not settings.openai_api_key:
             log_event(event="llm_call_outcome", outcome="api_error", reason="missing_api_key", model=model)
@@ -103,20 +106,36 @@ class OpenAIRepository:
         if reasoning_effort is not None:
             request_kwargs["reasoning_effort"] = reasoning_effort
 
+        started_at = time.perf_counter()
         try:
             response = await cls._get_client().chat.completions.create(**request_kwargs)
         except Exception as error:
-            log_event(event="llm_call_outcome", outcome="api_error", reason=str(error), model=model)
+            log_event(
+                event="llm_call_outcome",
+                outcome="api_error",
+                reason=str(error),
+                model=model,
+                duration_ms=round((time.perf_counter() - started_at) * 1000, 1),
+            )
             raise OpenAIUnavailableError(str(error)) from error
 
         usage = response.usage
         prompt_tokens = usage.prompt_tokens if usage else 0
         completion_tokens = usage.completion_tokens if usage else 0
         log_event(
+            # Same "event" as the api_error branch above and every other
+            # call site in this class -- every OpenAI call outcome is
+            # greppable under one tag, success or failure, with per-call
+            # duration_ms so a slow request's time can be attributed to the
+            # specific call that spent it, not just inferred from
+            # parse_service's one total-request-latency number.
+            event="llm_call_outcome",
+            outcome="success",
             model=model,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=usage.total_tokens if usage else 0,
+            duration_ms=round((time.perf_counter() - started_at) * 1000, 1),
         )
         record_token_usage_and_cost(model, prompt_tokens, completion_tokens)
         return response
@@ -129,14 +148,28 @@ class OpenAIRepository:
             log_event(event="llm_call_outcome", outcome="api_error", reason="missing_api_key", model=model)
             raise OpenAIUnavailableError("OPENAI_API_KEY is not configured")
 
+        started_at = time.perf_counter()
         try:
             response = await cls._get_client().embeddings.create(input=text, model=model)
         except Exception as error:
-            log_event(event="llm_call_outcome", outcome="api_error", reason=str(error), model=model)
+            log_event(
+                event="llm_call_outcome",
+                outcome="api_error",
+                reason=str(error),
+                model=model,
+                duration_ms=round((time.perf_counter() - started_at) * 1000, 1),
+            )
             raise OpenAIUnavailableError(str(error)) from error
 
         usage = response.usage
         prompt_tokens = usage.prompt_tokens if usage else 0
-        log_event(model=model, prompt_tokens=prompt_tokens, total_tokens=usage.total_tokens if usage else 0)
+        log_event(
+            event="llm_call_outcome",
+            outcome="success",
+            model=model,
+            prompt_tokens=prompt_tokens,
+            total_tokens=usage.total_tokens if usage else 0,
+            duration_ms=round((time.perf_counter() - started_at) * 1000, 1),
+        )
         record_token_usage_and_cost(model, prompt_tokens, completion_tokens=0)
         return response.data[0].embedding

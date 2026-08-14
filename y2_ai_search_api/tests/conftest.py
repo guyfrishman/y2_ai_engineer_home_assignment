@@ -16,15 +16,26 @@ def client():
 @pytest.fixture
 def mock_llm(monkeypatch):
     """Replace the OpenAI client so tests never hit the network. Tier 1
-    always succeeds with an empty-but-valid params object, matching
-    whatever schema it's asked for — good enough for tests that only need
-    the LLM fallback to resolve, not to assert on specific extracted values.
+    extraction always succeeds with an empty-but-valid params object,
+    matching whatever schema it's asked for — good enough for tests that
+    only need the LLM fallback to resolve, not to assert on specific
+    extracted values. The classify-only call (services.llm_fallback_service.
+    run_category_classification, response_format name "query_category") is
+    a distinct schema from extraction's "search_params" — answered with a
+    fixed default category so a test that happens to hit the
+    confidence==0.0 path doesn't unexpectedly degrade; tests that care which
+    category comes back (see test_zero_signal_classification.py) supply
+    their own fake_chat instead of this shared one.
     """
 
     async def fake_chat(messages, model, response_format=None, logprobs=False, max_completion_tokens=None):
         from types import SimpleNamespace
 
-        content = "{}"
+        schema_name = (response_format or {}).get("json_schema", {}).get("name")
+        if schema_name == "query_category":
+            content = '{"קטגוריה": "רכב"}'
+        else:
+            content = "{}"
         token_logprobs = [SimpleNamespace(token=character, logprob=-0.01) for character in content]
         return SimpleNamespace(
             choices=[

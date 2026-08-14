@@ -6,9 +6,9 @@ by ``extractor_service`` — no need to re-scan the query a second time."""
 import re
 from dataclasses import dataclass
 
-from repositories.taxonomy_repository import taxonomy_repository
+from repositories.taxonomy_repository import HEBREW_STOPWORDS, taxonomy_repository
 from schema.taxonomy_models import Vertical
-from services.normalizer_service import HEBREW_STOPWORDS
+from text_normalization import build_mark_tolerant_pattern
 
 # Rewards a clear single-vertical winner over a near-tie between the top two
 # verticals. A tie (margin 0) still earns half credit, since ambiguity
@@ -18,22 +18,16 @@ MARGIN_FACTOR_MAX = 1.0
 
 NUMERIC_TOKEN_PATTERN = re.compile(r"^[\d\-.,]+$")
 
-# Common Hebrew words that signal a vertical even though they're never a
-# taxonomy *value* — only part of a field's *name* or everyday phrasing
-# (e.g. "חדרים" signals נדל״ן's מס׳_חדרים field, but "חדרים" itself never
-# appears as a taxonomy enum value). Kept separate from
-# TaxonomyRepository.term_index, which stays strictly taxonomy-value-derived.
-VERTICAL_CUE_WORDS: dict[Vertical, frozenset[str]] = {
-    Vertical.REAL_ESTATE: frozenset(
-        {"חדר", "חדרים", "קומה", "קומות", "דירה", "דירות", "שכירות", "השכרה", "משכנתא", "נדלן", "נדל״ן"}
-    ),
-    Vertical.VEHICLES: frozenset(
-        {"רכב", "מכונית", "אוטו", "ק״מ", "קילומטר", "קילומטרים", "יד", "גיר", "תיבה", "דלק", "טסט"}
-    ),
-    Vertical.USED_GOODS: frozenset(
-        {"משומש", "יד_שנייה", "מכירה", "למכירה"}
-    ),
-}
+# Words that signal a vertical even though they're never a taxonomy
+# *value* — only part of a field's *name* or everyday phrasing (e.g.
+# "חדרים" signals נדל״ן's מס׳_חדרים field, but "חדרים" itself never appears
+# as a taxonomy enum value). Mechanically derived from the taxonomy itself
+# — see TaxonomyRepository._build_cue_words — not a hand-authored list: a
+# word not in the taxonomy, and not a sub-word of anything in it, isn't a
+# cue word here regardless of how useful it might be in principle; it's
+# what services.llm_fallback_service.run_category_classification (the
+# zero-signal LLM-classify fallback) exists for instead.
+VERTICAL_CUE_WORDS: dict[Vertical, frozenset[str]] = taxonomy_repository.cue_words
 
 
 @dataclass(frozen=True)
@@ -57,9 +51,14 @@ class ClassificationResult:
 # "תל אביב-יפו" is matched before any single-word term that happens to be a
 # substring of it. `(?<!\S)`/`(?!\S)` require whitespace (or string edge) on
 # both sides — a plain word-boundary `\b` behaves inconsistently across
-# Hebrew/Latin/digit mixes (e.g. "iPhone 13").
+# Hebrew/Latin/digit mixes (e.g. "iPhone 13"). build_mark_tolerant_pattern,
+# not re.escape: a term's internal punctuation (geresh, gershayim, slashes,
+# ...) is never the load-bearing part of a match — "קוטג׳"/"קוטג'"/"קוטג"
+# all match the same compiled pattern. matched_text stored below is always
+# the canonical `term`, never the regex match, so this never lets a
+# non-canonical mark variant leak into an extracted field value.
 _COMPILED_TERM_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
-    (term, re.compile(rf"(?<!\S){re.escape(term)}(?!\S)"))
+    (term, re.compile(rf"(?<!\S){build_mark_tolerant_pattern(term)}(?!\S)"))
     for term in taxonomy_repository.known_terms_by_length
 ]
 
@@ -115,8 +114,8 @@ def classify_query(canonical_query: str) -> ClassificationResult:
     (its own matched terms/cue words, plus any numeric token — numbers are
     treated as signal regardless of vertical, but only once the winning
     vertical already has at least one genuine taxonomy TERM match; see
-    docs/infrastructure/confidence-calibration.md) and margin_factor
-    rewards a clear winner over a near-tie with the runner-up vertical.
+    docs/DESIGN.md) and margin_factor rewards a clear winner over a
+    near-tie with the runner-up vertical.
     """
     words = canonical_query.split()
     occurrences = _scan_term_occurrences(canonical_query)
@@ -131,7 +130,7 @@ def classify_query(canonical_query: str) -> ClassificationResult:
     # it doesn't say what a bare "300" next to it even means (price? km?
     # year?) — so without an actual term match, a query that's mostly
     # numbers stays honestly low-confidence instead of scoring as if fully
-    # understood. See docs/infrastructure/confidence-calibration.md.
+    # understood. See docs/DESIGN.md.
     numeric_word_count = (
         sum(1 for word in non_stopword_words if NUMERIC_TOKEN_PATTERN.match(word))
         if winning_matched_word_count > 0

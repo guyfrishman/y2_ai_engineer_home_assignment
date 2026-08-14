@@ -60,6 +60,32 @@ def test_vehicle_km_and_year_extraction_does_not_collide_with_price():
     assert params["מחיר"] == {"max": 60000}
 
 
+def test_model_number_digits_are_not_misread_as_price():
+    # Regression: a mark-tolerant unit pattern with no trailing boundary
+    # degenerates to a bare substring match -- "ש״ח"'s tolerant form
+    # ("ש"+[marks]*+"ח") used to match the first two letters of "שחור"
+    # (black), so "S23 ... שחור" misread the "23" in the model name "S23"
+    # as a price. Fixed with a (?!\w) boundary after every unit pattern.
+    params = _parse_with_rules("סמסונג גלקסי S23 256 גיגה שחור כמו חדש")
+    assert "מחיר" not in params
+    assert params["צבע"] == "שחור"
+    assert params["נפח_אחסון"] == "256GB"
+
+
+def test_km_extraction_tolerates_ascii_quote_curly_quote_and_no_mark():
+    # ק"מ / ק'מ / קמ (no mark at all) must all extract the same way as the
+    # canonical ק״מ — build_mark_tolerant_alternation, not a hand-enumerated
+    # list of which quote characters count.
+    for variant_text in ['100000 ק"מ', "100000 ק’מ", "100000 קמ"]:
+        params = _parse_with_rules(f"מאזדה CX-5 {variant_text}")
+        assert params["ק״מ"] == 100000
+
+
+def test_horsepower_extraction_tolerates_ascii_quote():
+    params = _parse_with_rules('טויוטה קורולה 150 כ"ס')
+    assert params["הספק_כ״ס"] == 150
+
+
 def test_real_estate_sale_with_amenities_resolves_via_rules():
     # docs/examples.md #2 — no cross-vertical term overlap, clears the
     # confidence threshold on rules alone.

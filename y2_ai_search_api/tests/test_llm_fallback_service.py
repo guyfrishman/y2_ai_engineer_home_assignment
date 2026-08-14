@@ -127,7 +127,7 @@ async def test_scoped_schema_narrows_what_is_asked_not_what_is_allowed(monkeypat
     it must never narrow what's ALLOWED through validation. Proven with the
     one check that only fires on the full merged object, not on the LLM's
     own scoped response in isolation: UsedGoodsParams' sector/subcategory
-    cross-field validator (see docs/decisions/0001-...). סקטור is already
+    cross-field validator (see docs/DESIGN.md). סקטור is already
     known from the rule path, so the scoped schema never even asks the LLM
     about it; the LLM's own scoped response supplies a real, individually-
     valid תת_קטגוריה that simply doesn't belong to that סקטור. If
@@ -186,3 +186,28 @@ def test_strict_json_schema_has_no_optional_fields_and_forbids_extras():
         if "properties" in def_schema:
             assert def_schema["additionalProperties"] is False
             assert set(def_schema["required"]) == set(def_schema["properties"].keys())
+
+
+async def test_category_classification_success_logs_the_chosen_vertical(monkeypatch):
+    # Observability: for a routing call, "what did it decide" is the
+    # headline fact -- it must be in the success log itself, not something
+    # only recoverable by correlating a later, separate parse_decision log
+    # line via trace_id.
+    logged = {}
+
+    def fake_log_event(**fields):
+        logged.update(fields)
+
+    async def fake_chat(messages, model, response_format=None, logprobs=False, max_completion_tokens=None):
+        return _fake_response({"קטגוריה": Vertical.VEHICLES.value})
+
+    monkeypatch.setattr(llm_fallback_service, "log_event", fake_log_event)
+    monkeypatch.setattr(llm_fallback_service.OpenAIRepository, "chat", staticmethod(fake_chat))
+
+    result = await llm_fallback_service.run_category_classification("ג'יפ קטן")
+
+    assert result == Vertical.VEHICLES
+    assert logged["event"] == "llm_call_outcome"
+    assert logged["tier"] == "classify"
+    assert logged["outcome"] == "success"
+    assert logged["vertical"] == Vertical.VEHICLES.value

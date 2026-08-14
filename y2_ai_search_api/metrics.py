@@ -44,7 +44,7 @@ PARSE_COST_USD_TOTAL = Counter(
 # per 1M tokens. Embeddings have no "completion" side, priced at 0.
 # gpt-4.1-nano/mini, not gpt-5-nano/mini: the entire gpt-5 family rejects
 # logprobs requests (verified live, 403), which this service's confidence
-# score depends on — see docs/decisions/0001-hybrid-rule-first-llm-fallback-pipeline.md.
+# score depends on — see docs/DESIGN.md.
 MODEL_PRICING_USD_PER_MILLION_TOKENS: dict[str, dict[str, float]] = {
     "gpt-4.1-nano": {"prompt": 0.10, "completion": 0.40},
     "gpt-4o-mini": {"prompt": 0.15, "completion": 0.60},

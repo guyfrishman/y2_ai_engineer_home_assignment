@@ -1,7 +1,6 @@
-"""Structured JSON event logging — one function, ``log_event``. See
-docs/conventions/logging.md for the shape and why the previous
-@log_activity-decorator-on-every-function design was replaced with this.
-"""
+"""Structured JSON event logging — one function, ``log_event``, called
+explicitly at each meaningful pipeline step rather than via a decorator on
+every function."""
 
 import json
 import logging

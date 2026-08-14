@@ -1,7 +1,7 @@
 """Orchestrates the full pipeline: sanitize -> normalize -> cache lookup ->
 in-flight coalescing -> classify+extract -> threshold check -> [LLM
 fallback] -> cache write -> return. The only module that sequences the
-others — see docs/decisions/0001-hybrid-rule-first-llm-fallback-pipeline.md.
+others — see docs/DESIGN.md.
 """
 
 import asyncio
@@ -16,7 +16,12 @@ from schema.responses import ParseResponse
 from schema.taxonomy_models import VERTICAL_METRIC_LABELS
 from services.classifier_service import classify_query
 from services.extractor_service import extract_params
-from services.llm_fallback_service import run_llm_fallback
+from services.llm_fallback_service import (
+    CATEGORY_DEGRADED_NOTE,
+    DEGRADED_CONFIDENCE,
+    run_category_classification,
+    run_llm_fallback,
+)
 from services.normalizer_service import normalize_query
 from services.sanitizer_service import sanitize_query
 
@@ -147,9 +152,50 @@ async def _resolve(canonical_query: str, cache_key: str) -> ParseResult:
         cache_repository.set(cache_key, response.model_dump(mode="json"))
         return ParseResult(response=response, path="rules")
 
-    fallback_result = await run_llm_fallback(classification.vertical, canonical_query, rule_path_params)
+    vertical = classification.vertical
+    if classification.confidence == 0.0:
+        # Exactly 0.0, not "below some threshold": this is the precise,
+        # already-proven case of zero taxonomy-term/cue-word evidence for
+        # every vertical (see classifier_service.classify_query) -- at this
+        # point `classification.vertical` is Vertical's first-declared
+        # member via max()'s tie-break, not a real pick, and handing it to
+        # run_llm_fallback as if it were one is exactly the bug this branch
+        # exists to close. Anything above 0.0 is real partial signal and
+        # keeps going through the unmodified path below, using
+        # classification.vertical as a genuine hint.
+        llm_vertical = await run_category_classification(canonical_query)
+        if llm_vertical is None:
+            # The classify-only call itself failed -- a different, and
+            # worse, failure mode than a shaky extraction: the category is
+            # unknown, not just the fields. Degrade honestly to the rule
+            # path's own (defaulted) result rather than pretend it's real.
+            response = ParseResponse(
+                category=classification.vertical,
+                params=rule_path_params.model_dump(exclude_none=True),
+                confidence=DEGRADED_CONFIDENCE,
+                notes=[CATEGORY_DEGRADED_NOTE],
+            )
+            log_event(
+                event="parse_decision",
+                path="llm",
+                outcome="category_degraded",
+                vertical=classification.vertical.value,
+                rule_path_confidence=classification.confidence,
+                confidence=DEGRADED_CONFIDENCE,
+            )
+            cache_repository.set(cache_key, response.model_dump(mode="json"))
+            return ParseResult(response=response, path="llm")
+
+        vertical = llm_vertical
+        # Occurrences are empty by construction here -- confidence == 0.0
+        # means no vertical (including the newly-classified one) had any
+        # taxonomy-term or cue-word match, so there's nothing beyond
+        # regex-only fields (price, year, ...) for the extractor to fill.
+        rule_path_params = extract_params(vertical, canonical_query, [])
+
+    fallback_result = await run_llm_fallback(vertical, canonical_query, rule_path_params)
     response = ParseResponse(
-        category=classification.vertical,
+        category=vertical,
         params=fallback_result.params.model_dump(exclude_none=True),
         confidence=fallback_result.confidence,
         notes=fallback_result.notes,
@@ -158,7 +204,7 @@ async def _resolve(canonical_query: str, cache_key: str) -> ParseResult:
         event="parse_decision",
         path="llm",
         tier_used=fallback_result.tier_used,
-        vertical=classification.vertical.value,
+        vertical=vertical.value,
         rule_path_confidence=classification.confidence,
         confidence=fallback_result.confidence,
     )

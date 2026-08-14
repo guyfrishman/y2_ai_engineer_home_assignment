@@ -69,10 +69,11 @@ async def test_concurrent_identical_llm_queries_coalesce_into_one_api_call(monke
     monkeypatch.setattr(OpenAIRepository, "chat", staticmethod(fake_chat))
     monkeypatch.setattr(OpenAIRepository, "embed", staticmethod(fake_embed))
 
-    # Rule confidence 0.5 < confidence_threshold (0.58) -> every one of
-    # these identical concurrent requests would trigger the LLM fallback
-    # if not coalesced.
-    query = "דירת 3 חדרים בירושלים עד מליון שח"
+    # Rule confidence 0.5625 < confidence_threshold (0.58) -- "ירושלים" is a
+    # genuine cross-vertical term (a נדל״ן city *and* a יד_שנייה region) --
+    # so every one of these identical concurrent requests would trigger the
+    # LLM fallback if not coalesced.
+    query = "דירה בירושלים עד מיליון שח"
     concurrency = 10
     results = await asyncio.gather(*(parse_service.parse_query(query) for _ in range(concurrency)))
 

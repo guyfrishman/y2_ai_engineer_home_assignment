@@ -19,21 +19,13 @@ import json
 import math
 from typing import Any
 
+from logger import log_event
 from repositories.openai_repository import OpenAIRepository, OpenAIUnavailableError
+from schema.taxonomy_models import Vertical
 
-# Initial, tunable weighting — not a fixed law. See
-# docs/infrastructure/confidence-calibration.md.
+# Initial, tunable weighting — not a fixed law. See docs/DESIGN.md.
 LOGPROB_WEIGHT = 0.7
 EMBEDDING_WEIGHT = 0.3
-
-# When the logprob signal alone is already this decisive (near-certain or
-# near-zero), the embedding cross-check's independent semantic-sanity-check
-# role has little left to add — a clear-cut case doesn't need a second
-# opinion. Skipping it saves ~173ms average (measured,
-# docs/infrastructure/latency-investigation.md) and 2 embedding API calls
-# on exactly the responses least likely to need them.
-DECISIVE_HIGH_THRESHOLD = 0.9
-DECISIVE_LOW_THRESHOLD = 0.1
 
 
 def _reconstruct_text_and_token_spans(token_logprobs: list) -> tuple[str, list[tuple[int, int, float]]]:
@@ -108,7 +100,14 @@ def compute_logprob_confidence(token_logprobs: list, present_field_names: list[s
     return math.exp(mean_logprob)
 
 
-def _params_to_synthetic_sentence(params: dict[str, Any]) -> str:
+def _params_to_synthetic_sentence(params: dict[str, Any], vertical: Vertical) -> str:
+    """Reconstruct the extracted params as a Hebrew sentence for the
+    embedding cross-check, prefixed with the assigned category. An
+    out-of-domain extraction (a car query force-extracted under נדל״ן) can
+    still score deceptively well on shared incidental field-value keywords
+    alone — embedding against "קטגוריה: X, ..." makes the category itself
+    part of what gets compared, not just the field values.
+    """
     parts = []
     for field_name, value in params.items():
         if isinstance(value, dict):
@@ -118,7 +117,9 @@ def _params_to_synthetic_sentence(params: dict[str, Any]) -> str:
             parts.append(f"{field_name}: {', '.join(str(item) for item in value)}")
         else:
             parts.append(f"{field_name}: {value}")
-    return " ".join(parts)
+    if not parts:
+        return ""
+    return f"קטגוריה: {vertical.value}, " + " ".join(parts)
 
 
 def _cosine_similarity(vector_a: list[float], vector_b: list[float]) -> float:
@@ -130,8 +131,8 @@ def _cosine_similarity(vector_a: list[float], vector_b: list[float]) -> float:
     return dot_product / (norm_a * norm_b)
 
 
-async def compute_embedding_similarity(canonical_query: str, params: dict[str, Any]) -> float:
-    synthetic_sentence = _params_to_synthetic_sentence(params)
+async def compute_embedding_similarity(canonical_query: str, params: dict[str, Any], vertical: Vertical) -> float:
+    synthetic_sentence = _params_to_synthetic_sentence(params, vertical)
     if not synthetic_sentence:
         return 0.0
     query_embedding, params_embedding = await asyncio.gather(
@@ -145,19 +146,50 @@ async def compute_llm_confidence(
     token_logprobs: list,
     present_field_names: list[str],
     validated_params: dict[str, Any],
+    vertical: Vertical,
 ) -> float:
+    """Blends two independent signals, always -- a model can be
+    high-confidence about tokens it typed while being categorically wrong
+    about what it should have been asked at all, so a decisive logprob
+    score alone is no longer treated as license to skip the embedding
+    cross-check (see docs/DESIGN.md for the measured latency/cost this
+    costs, and why it's paid on every LLM-fallback response now, not just
+    the ones the old logprob-decisiveness heuristic judged borderline).
+    """
     logprob_confidence = compute_logprob_confidence(token_logprobs, present_field_names)
 
-    if logprob_confidence >= DECISIVE_HIGH_THRESHOLD or logprob_confidence <= DECISIVE_LOW_THRESHOLD:
-        return min(max(logprob_confidence, 0.0), 1.0)
-
     try:
-        embedding_similarity = await compute_embedding_similarity(canonical_query, validated_params)
-    except OpenAIUnavailableError:
+        embedding_similarity = await compute_embedding_similarity(canonical_query, validated_params, vertical)
+        embedding_outcome = "success"
+    except OpenAIUnavailableError as error:
         # A successful extraction shouldn't be thrown away because the
         # unrelated embedding cross-check couldn't run — fall back to the
-        # logprob signal alone rather than failing the whole tier.
+        # logprob signal alone rather than failing the whole tier. Logged
+        # explicitly: silently substituting logprob_confidence for the
+        # embedding signal means this response's "confidence" no longer
+        # reflects an independent cross-check at all, on a path (LLM
+        # fallback -> confidence scoring) where that distinction matters.
         embedding_similarity = logprob_confidence
+        embedding_outcome = "unavailable_fell_back_to_logprob_only"
+        log_event(
+            event="confidence_embedding_cross_check_unavailable",
+            vertical=vertical.value,
+            reason=str(error),
+            logprob_confidence=round(logprob_confidence, 4),
+        )
 
     confidence = LOGPROB_WEIGHT * logprob_confidence + EMBEDDING_WEIGHT * embedding_similarity
-    return min(max(confidence, 0.0), 1.0)
+    confidence = min(max(confidence, 0.0), 1.0)
+    # The headline number a caller sees is the blend; without this, there is
+    # no way from the logs to tell whether a low (or a deceptively high)
+    # confidence came from the model's own token-level uncertainty, a
+    # semantic mismatch the embedding cross-check caught, or both.
+    log_event(
+        event="confidence_computed",
+        vertical=vertical.value,
+        logprob_confidence=round(logprob_confidence, 4),
+        embedding_similarity=round(embedding_similarity, 4),
+        embedding_outcome=embedding_outcome,
+        confidence=round(confidence, 4),
+    )
+    return confidence

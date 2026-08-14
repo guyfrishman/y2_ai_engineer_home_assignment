@@ -1,8 +1,7 @@
 """Full-response cache: canonical-query -> serialized ParseResponse dict.
 
-Same swappable-interface seam as the template's SessionRepository — an
-in-memory TTL cache today, a Redis-backed implementation later, with no
-change to parse_service.
+A swappable-interface seam — an in-memory TTL cache today, a Redis-backed
+implementation later, with no change to parse_service.
 """
 
 import hashlib
@@ -39,8 +38,8 @@ class CacheRepository(ABC):
 class InMemoryTTLCache(CacheRepository):
     """Process-local cache backed by ``cachetools.TTLCache`` — bounded size
     with least-recently-used eviction once full, and time-based expiry.
-    Lost on process restart, same trade-off the template's
-    InMemorySessionRepository makes for local development and demos.
+    Lost on process restart — an accepted trade-off for local development
+    and demos.
     """
 
     def __init__(self) -> None:

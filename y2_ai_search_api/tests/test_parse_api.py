@@ -43,8 +43,10 @@ def test_parse_without_openai_key_degrades_gracefully_instead_of_500ing(client, 
     monkeypatch.setattr(settings, "openai_api_key", "")
     # A low-confidence query should still return 200 with a usable (if
     # low-confidence) result, never fail the request just because the LLM
-    # fallback was unreachable.
-    response = client.post("/parse", json={"q": "דירת 3 חדרים בירושלים עד מליון שח"})
+    # fallback was unreachable. "ירושלים" is a genuine cross-vertical term
+    # (a נדל״ן city *and* a יד_שנייה region), which is what keeps this below
+    # confidence_threshold.
+    response = client.post("/parse", json={"q": "דירה בירושלים עד מיליון שח"})
     assert response.status_code == 200
     assert response.headers["x-parse-path"] == "llm"
     body = response.json()
@@ -57,7 +59,7 @@ def test_parse_without_openai_key_degrades_gracefully_instead_of_500ing(client, 
 
 
 def test_parse_with_mocked_llm_resolves_via_llm_path(client, mock_llm):
-    response = client.post("/parse", json={"q": "דירת 3 חדרים בירושלים עד מליון שח"})
+    response = client.post("/parse", json={"q": "דירה בירושלים עד מיליון שח"})
     assert response.status_code == 200
     assert response.headers["x-parse-path"] == "llm"
 

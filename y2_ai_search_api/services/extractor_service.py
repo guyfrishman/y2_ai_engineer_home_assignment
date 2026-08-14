@@ -12,9 +12,10 @@ from pydantic import BaseModel, ValidationError
 from repositories.taxonomy_repository import taxonomy_repository
 from schema.taxonomy_models import Vertical
 from services.classifier_service import TermOccurrence
+from text_normalization import build_mark_tolerant_alternation
 
-_SQM_UNIT_PATTERN = r"(?:מ\"ר|מ״ר|מטרים רבועים|מטר מרובע|מ'|מטרים|מטר)"
-_CURRENCY_UNIT_PATTERN = r"ש״ח"
+_SQM_UNIT_PATTERN = build_mark_tolerant_alternation("מ״ר", "מטרים רבועים", "מטר מרובע", "מ׳", "מטרים", "מטר")
+_CURRENCY_UNIT_PATTERN = build_mark_tolerant_alternation("ש״ח")
 
 
 def _collect_field_values(occurrences: list[TermOccurrence], field_name: str) -> list[str]:
@@ -57,7 +58,18 @@ def _extract_bounded_number(
     """Recognize "X-Y[unit]" as a range, "עד X[unit]" as a max-only range,
     "מעל X[unit]" as a min-only range, or (only when a unit is present, to
     avoid misattributing an unrelated bare number) "X[unit]" as a scalar."""
-    suffix = rf"\s*{unit_pattern}" if unit_pattern else ""
+    # (?!\w) after the unit -- not (?!\S), which would also reject a
+    # trailing punctuation mark: without *some* trailing boundary, a
+    # mark-tolerant unit pattern (see text_normalization.build_mark_tolerant_pattern)
+    # can match as a bare substring prefix of an unrelated word -- e.g.
+    # "ש״ח"'s tolerant form is "ש"+[marks]*+"ח", which matches the first two
+    # letters of "שחור" (black) with zero marks in between. Confirmed
+    # reproducible: "...S23 ... שחור" was misreading the "23" in the model
+    # name "S23" as a price, because "שחור" later in the string satisfied
+    # the (now markless-optional) currency pattern. (?!\w) blocks that (the
+    # following "ו" is a word character) while still letting the unit
+    # abut ordinary punctuation like a trailing period.
+    suffix = rf"\s*{unit_pattern}(?!\w)" if unit_pattern else ""
 
     range_match = re.search(rf"(\d+)\s*-\s*(\d+){suffix}", text)
     if range_match:
@@ -164,7 +176,7 @@ def extract_real_estate_params(canonical_query: str, occurrences: list[TermOccur
     if floor is not None:
         params["קומה"] = floor
 
-    working_text, sqm = _extract_and_consume(working_text, rf"(\d+)\s*{_SQM_UNIT_PATTERN}")
+    working_text, sqm = _extract_and_consume(working_text, rf"(\d+)\s*{_SQM_UNIT_PATTERN}(?!\w)")
     if sqm is not None:
         params["מ״ר_בנוי"] = sqm
 
@@ -209,15 +221,21 @@ def extract_vehicle_params(canonical_query: str, occurrences: list[TermOccurrenc
     if hand is not None:
         params["יד"] = hand
 
-    working_text, km = _extract_and_consume(working_text, r"(\d+)\s*(?:ק\"מ|ק״מ|קילומטר|קילומטרים)")
+    working_text, km = _extract_and_consume(
+        working_text, rf"(\d+)\s*{build_mark_tolerant_alternation('ק״מ', 'קילומטר', 'קילומטרים')}(?!\w)"
+    )
     if km is not None:
         params["ק״מ"] = km
 
-    working_text, horsepower = _extract_and_consume(working_text, r"(\d+)\s*(?:כ\"ס|כ״ס)")
+    working_text, horsepower = _extract_and_consume(
+        working_text, rf"(\d+)\s*{build_mark_tolerant_alternation('כ״ס')}(?!\w)"
+    )
     if horsepower is not None:
         params["הספק_כ״ס"] = horsepower
 
-    working_text, engine_cc = _extract_and_consume(working_text, r"(\d+)\s*(?:סמ\"ק|סמ״ק|סיסי)")
+    working_text, engine_cc = _extract_and_consume(
+        working_text, rf"(\d+)\s*{build_mark_tolerant_alternation('סמ״ק', 'סיסי')}(?!\w)"
+    )
     if engine_cc is not None:
         params["נפח_מנוע_סמ״ק"] = engine_cc
 
@@ -247,12 +265,14 @@ def extract_used_goods_params(canonical_query: str, occurrences: list[TermOccurr
         if value:
             params[field_name] = value
 
-    storage_match = re.search(r"(\d+)\s*(?:GB|ג'יגה|גיגה)", working_text)
+    storage_match = re.search(rf"(\d+)\s*{build_mark_tolerant_alternation('GB', 'ג׳יגה', 'גיגה')}(?!\w)", working_text)
     if storage_match:
         params["נפח_אחסון"] = f"{storage_match.group(1)}GB"
         working_text = working_text[: storage_match.start()] + " " * len(storage_match.group(0)) + working_text[storage_match.end() :]
 
-    working_text, screen_size = _extract_and_consume(working_text, r"(\d+)\s*(?:אינץ|אינצ׳)")
+    working_text, screen_size = _extract_and_consume(
+        working_text, rf"(\d+)\s*{build_mark_tolerant_alternation('אינץ', 'אינצ׳')}(?!\w)"
+    )
     if screen_size is not None:
         params["גודל_אינצ׳"] = screen_size
 

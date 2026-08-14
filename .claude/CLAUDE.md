@@ -1,6 +1,5 @@
 # Working in this repo
-Read docs/AGENTS.md first, then whichever docs/conventions/*.md file covers
-what you're about to touch, and docs/services/search-api.md for the service
-reference. Follow docs/conventions/work-protocol.md for anything non-trivial.
-
-@docs/AGENTS.md
+Read README.md and docs/DESIGN.md first. `data/taxonomy.json` is the
+allowlist for every field this service can output — never hand-add a field
+name anywhere in the pipeline that isn't sourced from it. `uv run pytest`
+must stay green.

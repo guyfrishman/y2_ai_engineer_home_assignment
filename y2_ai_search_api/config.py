@@ -19,23 +19,22 @@ class Settings(BaseSettings):
     # Auth — when empty, API key auth is a no-op (open, for local dev/grading)
     api_access_key: str = ""
 
-    # OpenAI — this service is OpenAI-specific by design (see ADR 0002),
-    # not a swappable-provider abstraction.
+    # OpenAI — this service is OpenAI-specific by design, not a
+    # swappable-provider abstraction.
     openai_api_key: str = ""
     # gpt-5-nano/gpt-5-mini were the original picks by price, but OpenAI
     # rejects logprobs requests on the entire gpt-5 family (verified live,
     # 403 "not allowed to request logprobs from this model") — and this
     # service's confidence score depends on logprobs. gpt-4.1-nano/mini are
     # the cheapest models confirmed (live) to support both Structured
-    # Outputs strict mode and logprobs together. See
-    # docs/decisions/0001-hybrid-rule-first-llm-fallback-pipeline.md.
+    # Outputs strict mode and logprobs together. See docs/DESIGN.md.
     openai_fallback_model: str = "gpt-4.1-nano"
     openai_escalation_model: str = "gpt-4.1-mini"
     openai_embedding_model: str = "text-embedding-3-small"
 
     # Rule-path confidence at or above this value skips the LLM fallback
     # entirely. Tuned against the golden example set in docs/examples.md —
-    # see docs/infrastructure/confidence-calibration.md.
+    # see docs/DESIGN.md's Confidence methodology section.
     confidence_threshold: float = 0.58
 
     # Full-response cache (normalized-query -> ParseResponse)
