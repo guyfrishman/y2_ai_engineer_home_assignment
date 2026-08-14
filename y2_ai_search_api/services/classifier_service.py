@@ -1,7 +1,3 @@
-"""Rule-based vertical detection: scans the canonical query for known
-taxonomy terms, picks the vertical with the strongest coverage, and scores
-a confidence for that decision. The term occurrences found here are reused
-by ``extractor_service`` — no need to re-scan the query a second time."""
 
 import re
 from dataclasses import dataclass
@@ -10,9 +6,6 @@ from repositories.taxonomy_repository import HEBREW_STOPWORDS, taxonomy_reposito
 from schema.taxonomy_models import Vertical
 from text_normalization import build_mark_tolerant_pattern
 
-# Rewards a clear single-vertical winner over a near-tie between the top two
-# verticals. A tie (margin 0) still earns half credit, since ambiguity
-# between verticals isn't the same as finding no signal at all.
 MARGIN_FACTOR_MIN = 0.5
 MARGIN_FACTOR_MAX = 1.0
 

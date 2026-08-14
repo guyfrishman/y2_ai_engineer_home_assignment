@@ -1,9 +1,3 @@
-"""Full-response cache: canonical-query -> serialized ParseResponse dict.
-
-A swappable-interface seam — an in-memory TTL cache today, a Redis-backed
-implementation later, with no change to parse_service.
-"""
-
 import hashlib
 from abc import ABC, abstractmethod
 from typing import Any
@@ -17,10 +11,6 @@ from repositories.taxonomy_repository import taxonomy_repository
 
 
 def build_cache_key(canonical_query: str) -> str:
-    """Key = hash(taxonomy_version + canonical_query). Editing
-    data/taxonomy.json changes taxonomy_version, which invalidates every
-    stale entry for free — no manual cache-clear needed on a taxonomy update.
-    """
     payload = f"{taxonomy_repository.taxonomy_version}:{canonical_query}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -36,12 +26,6 @@ class CacheRepository(ABC):
 
 
 class InMemoryTTLCache(CacheRepository):
-    """Process-local cache backed by ``cachetools.TTLCache`` — bounded size
-    with least-recently-used eviction once full, and time-based expiry.
-    Lost on process restart — an accepted trade-off for local development
-    and demos.
-    """
-
     def __init__(self) -> None:
         self._cache: TTLCache = TTLCache(maxsize=settings.cache_max_size, ttl=settings.cache_ttl_seconds)
 

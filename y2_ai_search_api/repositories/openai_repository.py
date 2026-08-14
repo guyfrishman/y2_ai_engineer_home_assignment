@@ -1,21 +1,3 @@
-"""OpenAI-specific client — not a provider-agnostic abstraction. This
-service only ever calls OpenAI (the brief pins the provider), so the class
-is named and shaped for that rather than carrying a base-URL-swappable,
-multi-provider interface it would never use: Structured Outputs strict-mode
-JSON schemas and per-token logprobs (used directly for the measured
-LLM-tier confidence score) aren't universally supported the same way across
-OpenAI-compatible endpoints, and a name promising provider flexibility the
-implementation doesn't deliver would be dishonest.
-
-Async client, not sync: the LLM-fallback path is the only part of this
-service with real network I/O, and it must not block the event loop while
-waiting on it — a single slow model call would otherwise stall every other
-concurrent request the single-worker Uvicorn process is handling. The
-cheap, CPU-bound rule/cache path stays plain synchronous code (Python's GIL
-means threading it would add overhead with no real parallelism); only this
-network-bound edge needs asyncio.
-"""
-
 import time
 
 import httpx2
@@ -26,36 +8,14 @@ from logger import log_event
 from metrics import record_token_usage_and_cost
 
 Message = dict[str, str]
-
-# The SDK's own defaults are max_retries=2, timeout=600s — meaning one
-# "call" as measured anywhere else in this codebase could silently be up
-# to three sequential attempts with backoff, and a hung request could block
-# for ten minutes. This service already has its own retry-equivalent (the
-# Tier 1 -> Tier 2 -> degrade cascade), so the SDK retrying underneath that
-# just makes tier failures slower to observe, not more reliable. Explicit
-# and short instead.
 OPENAI_REQUEST_TIMEOUT_SECONDS = 5.0
 OPENAI_MAX_RETRIES = 0
-
-# Checked directly, not assumed: openai-python 3.x already configures a far
-# more generous pool than bare httpx's own defaults would suggest —
-# openai._constants.DEFAULT_CONNECTION_LIMITS
-# is max_connections=1000, max_keepalive_connections=100 on its vendored
-# httpx2 transport, not httpx's commonly-cited 100/20. This service's own
-# concurrency never approaches even the SDK's default, so this doubling is
-# not expected to change measured latency — kept explicit anyway (as an
-# httpx2.Limits, matching the SDK's own transport, not bare httpx.Limits,
-# which AsyncOpenAI's http_client parameter would reject) so the ceiling is
-# a documented, intentional value here rather than an SDK internal a future
-# reader has to go looking for.
 _OPENAI_CONNECTION_LIMITS = httpx2.Limits(max_connections=2000, max_keepalive_connections=200)
 
 
 class OpenAIUnavailableError(RuntimeError):
-    """Raised whenever a call to OpenAI cannot be attempted or fails —
-    missing API key, network error, rate limit, provider outage, etc.
-    Callers treat all of these uniformly as an ``api_error`` outcome and
-    fall back per the tier-escalation policy in ``llm_fallback_service``."""
+    """Raised whenever a call to OpenAI cannot be attempted or fails:
+    missing API key, network error, rate limit, provider outage, etc."""
 
 
 class OpenAIRepository:
@@ -82,16 +42,7 @@ class OpenAIRepository:
         max_completion_tokens: int | None = None,
         reasoning_effort: str | None = None,
     ):
-        """Send a chat completion request and return the raw response object
-        (not just the text) — callers need ``.choices[0].logprobs`` for the
-        confidence score and ``.usage`` for cost tracking, not only the
-        completion text.
 
-        ``reasoning_effort`` is GPT-5-family-specific (e.g. "minimal") and
-        unused by production code today — kept as an optional parameter
-        rather than a special case so a future decision to adopt a GPT-5
-        model doesn't need another signature change.
-        """
         if not settings.openai_api_key:
             log_event(event="llm_call_outcome", outcome="api_error", reason="missing_api_key", model=model)
             raise OpenAIUnavailableError("OPENAI_API_KEY is not configured")
@@ -123,12 +74,6 @@ class OpenAIRepository:
         prompt_tokens = usage.prompt_tokens if usage else 0
         completion_tokens = usage.completion_tokens if usage else 0
         log_event(
-            # Same "event" as the api_error branch above and every other
-            # call site in this class -- every OpenAI call outcome is
-            # greppable under one tag, success or failure, with per-call
-            # duration_ms so a slow request's time can be attributed to the
-            # specific call that spent it, not just inferred from
-            # parse_service's one total-request-latency number.
             event="llm_call_outcome",
             outcome="success",
             model=model,

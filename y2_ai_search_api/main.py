@@ -14,13 +14,7 @@ app = FastAPI(title=settings.project_name, version=settings.version)
 
 @app.middleware("http")
 async def trace_id_middleware(request: Request, call_next):
-    """Sets trace_id once per request, at the actual entry point — not
-    lazily by whichever function happened to run first, the previous
-    @log_activity design. Also the one place an unhandled exception gets
-    logged: a single event at this true boundary, replacing
-    @log_activity's per-function ERROR lines (one call could previously
-    produce several, one per decorated function on the stack).
-    """
+    """Sets trace_id once per request, at the entry point"""
     token = trace_id_var.set(str(uuid.uuid4()))
     try:
         return await call_next(request)
@@ -30,12 +24,6 @@ async def trace_id_middleware(request: Request, call_next):
     finally:
         trace_id_var.reset(token)
 
-
-# /health is open (liveness/readiness probe). /parse sits behind the API
-# key (a no-op when API_ACCESS_KEY is unset — see security.py).
 app.include_router(ping_router)
 app.include_router(api_router, dependencies=[Depends(verify_api_key)])
-
-# Adds GET /metrics, open, alongside HTTP-level request/status/latency
-# instrumentation. Custom pipeline metrics live in metrics.py.
 Instrumentator().instrument(app).expose(app)

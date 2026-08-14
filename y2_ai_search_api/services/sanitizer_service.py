@@ -1,17 +1,7 @@
-"""Input sanitization: strips unsafe/noisy characters from a raw query
-before any parsing happens, and enforces a hard length cap. Pure functions,
-no network calls."""
-
 import unicodedata
-
 from config import settings
 from logger import log_event
 
-# Unicode general categories treated as noise for a short Hebrew search
-# query: Cc/Cf/Co/Cs are control/format/private-use/surrogate characters
-# (includes zero-width joiners and bidi override attacks); So and Sk are
-# where emoji and their skin-tone modifiers live. Currency signs (Sc, e.g.
-# ₪) and ordinary punctuation are intentionally not in this set.
 _DISALLOWED_UNICODE_CATEGORIES = frozenset({"Cc", "Cf", "Co", "Cs", "So", "Sk"})
 
 

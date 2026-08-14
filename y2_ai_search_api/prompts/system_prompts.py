@@ -1,18 +1,4 @@
-"""Fixed system prompts for the LLM fallback tiers. Kept in code (versioned,
-reviewable), not a database.
-
-The prompt never interpolates user input beyond the vertical name, which
-comes from our own classifier, never from the request. Combined with
-Structured Outputs (the model's output is syntactically constrained to the
-given JSON schema no matter what it "decides" to do), this bounds what a
-prompt-injection attempt embedded in the user's query can achieve: even a
-successful injection can only express itself as a value inside a
-schema-conforming JSON object, never as free text, a tool call, or a leak
-of these instructions.
-"""
-
 from schema.taxonomy_models import Vertical
-
 
 def build_extraction_system_prompt(vertical: Vertical) -> str:
     return (
@@ -29,12 +15,6 @@ def build_extraction_system_prompt(vertical: Vertical) -> str:
 
 
 def build_classification_system_prompt() -> str:
-    """Used only for the routing-only call in
-    services.llm_fallback_service.run_category_classification, when the rule
-    path found zero evidence for every vertical. Category names come from
-    Vertical itself, never hand-typed here, so this can't drift out of sync
-    with the taxonomy's own vertical set.
-    """
     vertical_names = ", ".join(f"'{vertical.value}'" for vertical in Vertical)
     return (
         "You are a Hebrew marketplace search-query router for Yad2. "
