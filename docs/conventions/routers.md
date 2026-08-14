@@ -6,7 +6,7 @@ How the API structures its routes.
 
 ```python
 from fastapi import APIRouter
-from app.routers import search
+from routers import search
 
 api_router = APIRouter()
 api_router.include_router(search.router, tags=["Search"])
@@ -21,10 +21,10 @@ Rules:
 
 ```python
 from fastapi import APIRouter, HTTPException, Response, status
-from app.schema.requests import ParseRequest
-from app.schema.responses import ParseResponse
-from app.services.parse_service import parse_query
-from app.services.sanitizer_service import QueryRejectedError
+from schema.requests import ParseRequest
+from schema.responses import ParseResponse
+from services.parse_service import parse_query
+from services.sanitizer_service import QueryRejectedError
 
 router = APIRouter()
 

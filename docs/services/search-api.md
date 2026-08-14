@@ -142,21 +142,23 @@ docker compose up --build
   candidate causes were tested directly across two investigation rounds
   and all seven ruled out (`@log_activity`, the classifier's taxonomy-term
   scan, raw CPU/memory saturation, uvicorn tuning, connection-pool sizing,
-  3x replica capacity) before a minimal zero-app-code control test
-  (a bare FastAPI app, one instant route, one `asyncio.sleep` route)
-  reproduced the identical pattern and resolved it: it's the one-time cost
-  of establishing ~20 concurrent brand-new TCP connections from an empty
-  connection pool, paid once by the first wave of concurrent requests —
-  confirmed by IDs of every delayed request being exactly the first ~20
-  submitted, and by the effect vanishing on a second round against the
-  same already-warm client. Since every loadtest run in this investigation
-  used a fresh client against a freshly-restarted container, **most of the
-  "degradation" measured across both rounds was this cost, re-measured
-  repeatedly**, not a sustained property of the running service. Full
-  mechanism and every number: `docs/infrastructure/latency-investigation.md`'s
-  "Resolved" section — including a real-app-specific wrinkle where a cheap
-  warm-up alone doesn't fully close the gap, pointing at a second,
-  smaller one-time cost tied to the first genuine OpenAI call.
+  3x replica capacity). A minimal zero-app-code control test (a bare
+  FastAPI app, one instant route, one `asyncio.sleep` route), run
+  **natively on Windows**, reproduced a matching bimodal pattern — the
+  first ~20 concurrently-submitted requests paying a one-time cost, later
+  ones clean — and was initially reported as the resolved cause. A direct
+  reconciliation against this investigation's own earlier LLM-ratio A/B
+  result showed that doesn't fully hold: the **same** minimal app,
+  Dockerized (matching how the real app actually runs), does **not**
+  reproduce the effect — not with a synthetic sleep, not with a real
+  outbound HTTPS call to OpenAI, not with Prometheus instrumentation
+  added on top. The native-Windows mechanism is real but doesn't explain
+  the Dockerized deployment's behavior. What still stands: a direct
+  warm-vs-cold test against the real application itself (cold client +
+  fresh container failed the SLA; the same client warm passed cleanly) —
+  real and reproducible, root mechanism not fully identified. Full
+  reconciliation and every number: `docs/infrastructure/latency-investigation.md`'s
+  "Primary cause identified; one compounding factor confirmed open" section.
 
   Schema scoping — asking the model only for fields the rule path didn't
   already fill, instead of unioning every field for the vertical — was

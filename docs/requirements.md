@@ -131,28 +131,28 @@ behind a real nginx load balancer (no reproducible improvement, and a
 confirmed real cost: cache-hit rate drops since each replica keeps its
 own independent cache).
 
-**Resolved in a follow-up round, not left as an open infra guess.** A
-minimal FastAPI app with zero lines of this project's code (two routes,
-one instant, one `asyncio.sleep`) reproduced the identical bimodal
-pattern, ruling out every candidate above at once. Correlating client and
-server wall-clock timestamps pinned the ~280ms gap to the time *before*
-the server's handler starts running, not inside it (server-side handling
-measured 0.000ms for every "stuck" request); the IDs of every delayed
-request were exactly the first ~20 submitted, never a later one — the
-signature of a one-time cost paid once by the first wave of concurrent
-requests, not sustained contention. Confirmed directly: running the same
-traffic twice against the same client (no restart) showed clustering
-only on the first round; a completely clean second round followed
-immediately after, same server, same traffic. It is the cost of
-establishing ~20 concurrent brand-new TCP connections at once from an
-empty connection pool — and since `scripts/loadtest.py` created a fresh
-client on every invocation (and every test in this investigation also
-used a freshly-restarted container), **every "degraded" p95 measured in
-both investigation rounds was substantially re-measuring this one-time
-cost**, not a sustained property of the running service. Full mechanism,
-every number, and the residual real-app-specific wrinkle (a lightweight
-warm-up alone doesn't fully close the gap — see that section for why):
-`infrastructure/latency-investigation.md`'s "Resolved" section.
+**Narrowed further in a follow-up round, then honestly walked back from
+an initial over-claim.** A minimal FastAPI app with zero lines of this
+project's code (two routes, one instant, one `asyncio.sleep`), run
+**natively on Windows**, reproduced a bimodal pattern matching what the
+real app shows — the first ~20 concurrently-submitted requests paying a
+one-time cost, later ones clean, a pattern confirmed via client/server
+timestamp correlation (server-side handling measured 0.000ms; the delay
+sat entirely before the handler started running). That was initially
+reported as the resolved cause. A direct reconciliation against this
+investigation's own earlier LLM-ratio A/B result (0/144 vs. 26/129 over
+100ms) showed it doesn't fully hold: the same minimal app, run the same
+way but **inside Docker** — matching how the real app actually runs —
+does **not** reproduce the effect at all, whether the "slow" route is a
+synthetic sleep, a real outbound HTTPS call, or that same call with
+Prometheus instrumentation added. The native-Windows mechanism is real
+but doesn't transfer to the Dockerized deployment. What still stands: a
+direct warm-vs-cold test against the *real* application itself (cold
+client + fresh container failed the SLA at 205.8ms; the same client warm
+passed at 63.0ms) — real and reproducible, mechanism not fully
+identified. Full reconciliation, every number, and what's still an open
+question: `infrastructure/latency-investigation.md`'s "Primary cause
+identified; one compounding factor confirmed open" section.
 
 **Schema scoping — implemented and adopted, not left untested.** A
 related but more general idea than the originally-speculated "scope the

@@ -5,7 +5,7 @@
 `y2_ai_search_api/logger.py` exposes a single entry point:
 
 ```python
-from app.logger import log_event
+from logger import log_event
 
 log_event(event="cache_lookup", result="hit")
 ```

@@ -44,7 +44,9 @@
 ## Imports
 
 - Standard library, then third-party, then local — one blank line between groups.
-- Absolute imports within the `app` package (`from app.services... import ...`).
+- Absolute imports from the project root (`from services... import ...`) —
+  `y2_ai_search_api/` has no `app` package wrapper; modules live directly
+  at the project root (`config.py`, `services/`, `repositories/`, ...).
 - No wildcard imports.
 
 ## Naming

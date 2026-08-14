@@ -618,111 +618,140 @@ co-located inside the Docker network) than this investigation had
 available, and is recorded here as the concrete next step, not left
 unstated.
 
-## Resolved: the cache/rules p95 degradation is a cold-connection-pool artifact, not a network, infra, or code problem
+## Primary cause identified; one compounding factor confirmed open — not fully resolved
 
-The five candidates above were all infra/networking hypotheses, and all
-five came back negative. That redirected the investigation: not "which
-layer of the network stack is slow," but "why does the client-observed
-latency for a request the server itself processes in under a millisecond
-split into two distinct groups at all." Answering that directly resolved
-the open question.
+An earlier version of this section claimed the cache/rules p95
+degradation was **resolved** as a generic cold-connection-pool artifact.
+A direct reconciliation against this investigation's own earlier
+LLM-ratio A/B result (Track A, item 2: 0/144 vs. 26/129 requests over
+100ms, same concurrency, only LLM-path traffic presence differing) showed
+that claim doesn't fully hold up. This section keeps what's still true,
+states plainly what broke, and reports the corrected, narrower
+conclusion — including that a real mechanism remains genuinely
+unidentified, not just under-explained.
+
+### What's still true: a real cold-start artifact exists — on native Windows
 
 **A minimal control app — zero lines of this project's code — reproduces
-the exact same bimodal pattern.** A bare FastAPI app with two routes
-(`/fast` returning instantly, `/slow` doing `await asyncio.sleep(2.6)`
-— no cache, no classifier, no OpenAI client, no middleware) driven by
-the same concurrency-20 semaphore-limited `httpx` client pattern
-`loadtest.py` uses: **18/129 `/fast` requests clustered tightly at
-280-287ms**, the rest at 6-8ms. This conclusively rules out every piece
-of this codebase (cache, classifier, confidence calc, middleware,
-`OpenAIRepository`) as the cause — the artifact exists with none of it
-present.
+a bimodal pattern.** A bare FastAPI app with two routes (`/fast`
+returning instantly, `/slow` doing `await asyncio.sleep(2.6)` — no
+cache, no classifier, no OpenAI client, no middleware), run **natively
+on the Windows host** (not in Docker), driven by the same concurrency-20
+semaphore-limited `httpx` client pattern `loadtest.py` uses: **18/129
+`/fast` requests clustered tightly at 280-287ms**, the rest at 6-8ms.
+Correlating client and server wall-clock timestamps for the same delayed
+requests showed server-side handler execution was 0.000ms and response
+transmission was 1-4.5ms — the ~280ms sat entirely in the gap before the
+server's handler started running. The IDs of every delayed request were
+exactly the first 18 submitted, and the effect appeared even with **zero
+slow requests at all** (pure-fast, 129-request cold-pool run, still ~20
+stuck at ~289ms), and disappeared on a second round against the same,
+now-warm client (0/129 stuck). Nagle's algorithm was checked directly in
+CPython's own source (`selector_events.py`, `proactor_events.py` both
+call `_set_nodelay()` on every transport by default) and ruled out as the
+mechanism.
 
-**Nagle's algorithm was the obvious next suspect and was refuted by
-reading the actual stdlib source, not assumed.** `asyncio`'s own
-`selector_events.py` (Linux) and `proactor_events.py` (Windows) both call
-`base_events._set_nodelay()` on every socket transport they create,
-disabling Nagle by default — confirmed directly in CPython's source, on
-both the client and server side. There was no Nagle+delayed-ACK
-interaction to interact with in the first place.
+**All of that is real and reproducible.** It's a genuine native-Windows
+`asyncio`/`httpx` cold-connection-burst characteristic. The mistake was
+concluding it explains the Dockerized real application's degradation
+without checking whether it actually does.
 
-**Correlating client and server wall-clock timestamps for the same
-delayed requests pinpointed exactly where the time goes.** For every
-"stuck" request: server-side handler execution was **0.000ms**, response
-transmission back to the client was **1-4.5ms**, and the entire ~280ms
-sat in the gap between the client entering the request and the server's
-handler starting to run. And critically: the IDs of every delayed request
-were **exactly 0 through 17** — the first 18 fast requests submitted, by
-creation order, and none of the other 111. Not scattered, not correlated
-with which requests happened to run concurrently with a slow one — just
-the first ~20 (matching the concurrency limit exactly).
+### The reconciliation check, run directly
 
-**That pattern is the signature of a one-time cost paid by the first
-wave of concurrent requests, not sustained contention.** Confirmed
-directly: running the same fast+slow mix **twice** against the same
-`httpx.AsyncClient` (no restart) showed clustering only on the *first*
-round (18/129 >100ms) — the second and third rounds, same client, same
-server, same traffic mix, were completely clean (p95 36-47ms, 0 stuck).
-And critically, the effect appears even with **zero slow requests at
-all** — a pure-fast, 129-request cold-pool run also shows ~20 requests
-stuck at ~289ms. It was never about slow LLM requests contending with
-fast ones; it's the cost of establishing ~20 concurrent brand-new TCP
-connections at once from an empty connection pool, on this machine,
-regardless of what those connections are for.
+**First: did the earlier "no-LLM" A/B run (0/144 over 100ms) use an
+already-warm client?** No — checked directly. It ran
+`docker compose restart api` immediately beforehand and used a fresh
+`uv run python -c "..."` process (a new `httpx.AsyncClient`, cold pool),
+identical in structure to the degraded 10%-ratio run. Re-running it and
+inspecting **every** path bucket, not just `cache` (the earlier check's
+blind spot — the handful of genuine first-hits land in `rules`, which
+was never separately checked): `rules: n=6, max=44.7ms, 0 stuck`,
+`cache: n=144, max=58.7ms, 0 stuck`. Nothing was hiding in the bucket
+that wasn't checked before. The cold-client premise holds; the "already
+warm" explanation for the discrepancy does not.
 
-**This transfers directly to the real application.** The same
-warm-vs-cold test against the actual service: a cold client hitting a
-freshly-restarted container failed the SLA (cache/rules p95 205.8ms); the
-same client, still warm, immediately after, against the same server,
-passed cleanly (p95 63.0ms). Every "degraded" measurement in this
-investigation and the previous round used a fresh `httpx.AsyncClient`
-per `loadtest.py` invocation — meaning **every single p95 "violation"
-measured throughout both investigation rounds was substantially
-re-measuring this one-time connection-establishment cost**, not a
-sustained property of the running service.
+**Second: does connection-establishment alone (no LLM traffic, but
+without the small-query-pool/heavy-caching structure of the original
+ratio-based test) reproduce it on the real app?** Generated 129 distinct
+real high-confidence vehicle queries (`מאזדה CX-5 שנת 2020`-shaped,
+varying brand/model/year — no repeats, so no caching effect dilutes the
+sample the way 6 repeated texts did in the original test) and ran them
+against a freshly-restarted real container, cold client, concurrency 20,
+zero LLM traffic: **`rules: n=129, max=55.8ms, 0 stuck`.** Query
+diversity wasn't the confound either — cold-start connection
+establishment alone, on the real Dockerized app, does not produce
+clustering, no matter how the non-LLM traffic is shaped.
 
-**A wrinkle: a cheap warm-up doesn't fully close the gap on the real
-app, and that gap is itself informative.** Pre-warming the connection
-pool with 20-40 concurrent `GET /health` calls (near-instant, ~45ms
-total) reduces but doesn't eliminate the effect on the real service
-(still ~20-25/129 requests over 100ms, down from ~26-29 but not zero).
-Pre-warming with a small batch that includes at least one **genuine**
-LLM-path call — real network I/O to OpenAI, not a loopback sleep — gets
-cache/rules p95 to 100-129ms, passing the target, with only a handful of
-residual outliers. That gap between "any 20 connections" and
-"specifically including a real slow request" points to a second, smaller,
-real-app-specific one-time cost layered on top of the generic TCP-burst
-artifact — plausibly `AsyncOpenAI`'s first real DNS resolution and TLS
-handshake to OpenAI's servers (unlike the pure-loopback minimal repro,
-this app's slow path makes a real external connection), or the
-`functools.lru_cache`-wrapped `_strict_json_schema()` building each
-vertical's schema for the first time. Not isolated further within this
-session's budget — recorded here as the concrete next step rather than
-guessed at.
+**Third — the decisive check: does the minimal control app *itself*
+reproduce the effect when run the same way the real app actually
+runs, inside Docker?** The same minimal app (unchanged) built into a
+container and driven identically (concurrency 20, cold client, fresh
+container): **pure-fast, zero slow requests: 0/129 stuck.** Mixed
+fast+`asyncio.sleep(2.6)`-slow: **0/129 stuck.** Both flatly contradict
+the native-Windows result under otherwise-identical test structure — the
+cold-connection-burst artifact that's real and reproducible on native
+Windows **does not reproduce inside Docker at all.**
 
-**Fixed in `scripts/loadtest.py`:** `run_loadtest` now warms the
-connection pool (`concurrency` concurrent `GET /health` calls) before the
-timed portion of any run starts, so a fresh loadtest invocation no longer
-silently re-measures pure connection-establishment overhead as if it were
-request-handling latency. Given the finding above, this warm-up is a
-partial, not complete, fix for the *tool's* measurement — real
-steady-state latency is better represented if a run has already sent
-at least one real LLM-path request before the numbers that matter are
-recorded.
+**Ruling out what's different about a real slow request, one variable at
+a time.** Since Docker itself seemed to be the boundary, two more
+candidates were tested directly on the Dockerized minimal app rather
+than assumed: replacing the synthetic `asyncio.sleep` with a **real**
+outbound HTTPS call to `api.openai.com` (a genuine minimal chat
+completion, real DNS/TLS/network round trip, same host the real app
+talks to) — **0/129 stuck.** Adding `prometheus-fastapi-instrumentator`
+to the same real-OpenAI-call variant (matching the real app's own
+per-request instrumentation middleware, which the minimal app otherwise
+lacks entirely) — **0/129 stuck.** Neither outbound network activity
+from inside the container nor Prometheus's request middleware is the
+missing ingredient.
 
-**Practical implication, and where this leaves the honest SLA read:**
-this is not "no problem exists" — a genuinely cold service (a fresh
-deploy, a fresh autoscaled replica) really will show elevated latency on
-its first burst of concurrent traffic, cache/rules path included, until
-its connection pool and OpenAI-facing warm-up cost are paid once. But it
-is **not** the sustained, request-volume-scaling degradation the earlier
-"200-700ms under heavy concurrent LLM traffic" framing implied, and it is
-**not** caused by this codebase's request-handling, the cache, the
-classifier, Docker, WSL2, or the network. The concrete production
-recommendation this points to: a real deployment should exercise at
-least one request through each code path (rules and LLM) during startup,
-before accepting traffic — a standard "warm-up request" pattern, not a
-code fix to the service itself.
+### The honest, corrected conclusion
+
+**The cause is not resolved. It is narrowed, and several plausible
+mechanisms are now ruled out with direct evidence rather than assumed
+away:** not Nagle, not generic Docker outbound-networking contention, not
+`prometheus-fastapi-instrumentator`'s middleware, not query diversity or
+caching structure in the test itself, and — per this section's whole
+point — not the generic native-Windows cold-connection-burst mechanism
+either, since that specific mechanism demonstrably does not reproduce
+inside Docker. What remains genuinely unexplained is **why the full real
+application, specifically, shows the effect when a real OpenAI call is
+in the traffic mix, when a minimal app making the same kind of real call
+inside the same Docker environment does not.** The real application
+differs from the minimal repro in ways not yet tested in isolation: a
+much larger prompt (~3,500 tokens vs. "say hi"), Pydantic validation of a
+20-28-field taxonomy model, logprob math over up to 400 tokens, an
+embedding cross-check on some calls, structured JSON logging on every
+request, and the `openai` SDK's own client (`AsyncOpenAI`) rather than
+raw `httpx`. Any of these — or some combination — is the credible next
+place to look, not yet isolated within this session's budget.
+
+**What still stands, independent of the unresolved mechanism:** the
+direct warm-vs-cold test against the real application itself (not the
+minimal repro) is untouched by this reconciliation — a cold client
+hitting a freshly-restarted container failed the SLA (cache/rules p95
+205.8ms); the same client, warm, immediately after, against the same
+server, passed cleanly (p95 63.0ms). That observation is real regardless
+of which specific mechanism causes it. `scripts/loadtest.py`'s
+connection-pool warm-up (added on the strength of the now-corrected
+"resolved" conclusion) is kept — it's harmless, and pre-warming before
+timing is sound test methodology regardless of the exact mechanism — but
+its justification is now "reduces a real, if not fully explained,
+first-burst effect on this specific application," not "eliminates a
+generic, fully-understood artifact."
+
+**Practical implication, stated at the honest confidence level this
+reconciliation actually supports:** a genuinely cold service does show
+elevated cache/rules latency on its first burst of concurrent traffic
+when real LLM-path calls are in the mix — confirmed, real, reproducible
+on the actual application. It is **not** caused by Nagle, generic Docker
+networking, or Prometheus instrumentation — those are now ruled out with
+evidence, not just deprioritized. It does **not** correlate with the
+native-Windows cold-connection-burst mechanism this investigation
+initially (incorrectly) generalized from. The production recommendation
+— exercise each code path once at startup before accepting traffic —
+still holds as a reasonable mitigation, but is no longer backed by a
+fully-understood root cause, and should be described that way.
 
 ## Track B: the LLM call itself — decomposed, and one real optimization adopted
 
