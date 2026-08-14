@@ -2,6 +2,7 @@ import pytest
 
 from app.config import settings
 from app.repositories.cache_repository import cache_repository
+from app.services.llm_fallback_service import DEGRADED_CONFIDENCE
 
 
 @pytest.fixture(autouse=True)
@@ -48,7 +49,10 @@ def test_parse_without_openai_key_degrades_gracefully_instead_of_500ing(client, 
     assert response.headers["x-parse-path"] == "llm"
     body = response.json()
     assert body["category"] == "נדל״ן"
-    assert body["confidence"] < 0.3
+    # Both tiers fail (no key) -> degrade path -> the exact fixed constant,
+    # not just "some low number" -- asserting equality against the real
+    # constant catches drift immediately instead of silently tolerating it.
+    assert body["confidence"] == DEGRADED_CONFIDENCE
     assert body["notes"]
 
 

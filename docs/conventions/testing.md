@@ -7,7 +7,7 @@ cd api
 uv run pytest
 ```
 
-88 tests, `~2s`, zero network calls.
+99 tests, `~2s`, zero network calls.
 
 ## What's covered (`api/tests/`)
 
@@ -21,6 +21,7 @@ uv run pytest
 | `test_llm_confidence_service.py` | value-token span mapping isolates value uncertainty from JSON structure; embedding fallback behavior |
 | `test_llm_fallback_service.py` | tier1 success / tier1-fail→tier2 success / both-fail→degrade / api_error at each tier, strict-schema shape |
 | `test_parse_api.py` | `/parse` end-to-end incl. cache hit/miss, `/health`, `/metrics` |
+| `test_parse_service.py` | in-flight request coalescing — N concurrent identical LLM-path queries hit `OpenAIRepository` exactly once; concurrent callers all see the same failure when the coalesced call errors |
 | `test_auth.py` | open when `API_ACCESS_KEY` unset, 403 when set and wrong, open `/health`+`/metrics` regardless |
 | `test_security_redteam.py` | prompt injection, unicode tricks (zero-width, bidi override, homoglyphs), oversized input, slang, unknown-field rejection |
 

@@ -60,5 +60,17 @@ def get_api_access_key() -> str:
 
     Returns an empty string when unset, which the security layer treats as
     "auth disabled" (open access) for local development.
+
+    Deliberately still `os.getenv`, not `settings.api_access_key` — the
+    logging cleanup routed LOG_LEVEL/MAX_STR_LOG_LENGTH through Settings
+    precisely because those are set once at process start and never need
+    to change mid-run. This one does: `test_auth.py` toggles
+    `API_ACCESS_KEY` per test via `monkeypatch.setenv(...)`, and `settings`
+    is a module-level singleton built once at import — reading
+    `settings.api_access_key` here would freeze whatever value was present
+    when the process started, silently breaking every test that flips the
+    key at runtime. `verify_api_key` calls this function per-request
+    specifically so auth can be enabled/disabled live, which is the whole
+    point of `API_ACCESS_KEY` empty = open for local dev.
     """
     return os.getenv("API_ACCESS_KEY", settings.api_access_key) or ""

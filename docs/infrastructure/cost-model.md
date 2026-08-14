@@ -75,6 +75,11 @@ architecturally free.
 **Implemented:**
 - **Full-response caching** (`cache_repository.py`) — a repeated query
   never re-triggers classification, extraction, or a model call.
+- **In-flight request coalescing** (`parse_service.py`) — closes the gap
+  full-response caching alone leaves open: N *concurrent* identical
+  requests arriving before the first has finished (and cached) its
+  result — the realistic shape of a newly-popular query under real
+  traffic — now pay for exactly one LLM call between them, not N.
 - **Word-level normalization caching** (`functools.lru_cache` on
   `normalizer_service.correct_word`) — a second, smaller cache layer for
   the typo/fuzzy-correction step specifically, independent of whether the

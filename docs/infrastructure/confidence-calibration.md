@@ -13,6 +13,41 @@ explains how each path computes it and why.
 | LLM Tier 1 / Tier 2 success | `0.7 * logprob_confidence + 0.3 * embedding_similarity` | Measured, per-response |
 | Degrade (both tiers fail) | `0.15` | Fixed constant |
 
+## Numeric tokens need context to count as coverage
+
+The rule-path formula's `coverage_ratio` originally counted every numeric
+token as "explained" unconditionally, regardless of whether the winning
+vertical had any actual evidence connecting it to those numbers. That was
+a real bug, not a hypothetical: `"רכב 100 200 300 400 500"` — a cue word
+("car") plus five arbitrary, contextless numbers — scored a **maximal
+1.0 confidence**. Nothing about the query says whether those numbers are
+a price, a year, or a km reading; the rule path had no idea, but the
+formula reported total certainty.
+
+Fixed by gating numeric-token credit on the winning vertical having at
+least one genuine taxonomy **term** match — a matched brand, city,
+property type, and so on (`classifier_service.classify_query`,
+`winning_matched_word_count > 0`) — not merely a cue word. A cue word like
+"רכב" is real but weak evidence (it says "this is probably about
+vehicles," not "here's what field number 300 belongs to"); only an actual
+term match gives numbers real interpretive context. Without a term match,
+numbers no longer count toward coverage at all — `"123 456 789"` (no
+terms, no cue words) now scores `0.0` instead of the previous `0.5`, and
+the cue-word-only case above drops from `1.0` to `0.17`. Every golden
+example that legitimately relies on numeric coverage (`"טויוטה 2018 2019
+2020"`, etc.) is unaffected, since those all have a real term match
+(the brand) providing the gate. Regression tests:
+`tests/test_classifier_service.py`'s
+`test_bare_numbers_with_no_taxonomy_term_match_score_zero_confidence`,
+`test_cue_word_plus_unexplained_numbers_does_not_score_near_certain`, and
+`test_numbers_still_count_once_a_real_term_match_gives_them_context`.
+
+The alternative considered — down-weighting numeric tokens instead of
+gating them entirely — was rejected: it would still let a query with
+*many* numbers and only a cue word reach an inflated score, just requiring
+more numbers to get there, rather than closing the failure mode
+structurally.
+
 ## Why flat hardcoded LLM confidence bands were rejected
 
 An earlier version of this design used fixed bands — a flat `0.70` for any

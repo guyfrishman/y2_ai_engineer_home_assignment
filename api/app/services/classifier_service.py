@@ -113,8 +113,10 @@ def classify_query(canonical_query: str) -> ClassificationResult:
     confidence = coverage_ratio * margin_factor, where coverage_ratio is the
     fraction of non-stopword query tokens explained by the winning vertical
     (its own matched terms/cue words, plus any numeric token — numbers are
-    treated as signal regardless of vertical) and margin_factor rewards a
-    clear winner over a near-tie with the runner-up vertical.
+    treated as signal regardless of vertical, but only once the winning
+    vertical already has at least one genuine taxonomy TERM match; see
+    docs/infrastructure/confidence-calibration.md) and margin_factor
+    rewards a clear winner over a near-tie with the runner-up vertical.
     """
     words = canonical_query.split()
     occurrences = _scan_term_occurrences(canonical_query)
@@ -122,9 +124,21 @@ def classify_query(canonical_query: str) -> ClassificationResult:
     winning_vertical = max(scores, key=lambda vertical: scores[vertical])
 
     non_stopword_words = [word for word in words if word not in HEBREW_STOPWORDS]
-    numeric_word_count = sum(1 for word in non_stopword_words if NUMERIC_TOKEN_PATTERN.match(word))
+    winning_matched_word_count = _matched_word_count(occurrences, winning_vertical)
+    # Numbers only count as "explained" once there's a real taxonomy term
+    # match giving them interpretive context (a matched brand, city,
+    # property type, ...). A cue word alone ("רכב") is too weak a signal —
+    # it doesn't say what a bare "300" next to it even means (price? km?
+    # year?) — so without an actual term match, a query that's mostly
+    # numbers stays honestly low-confidence instead of scoring as if fully
+    # understood. See docs/infrastructure/confidence-calibration.md.
+    numeric_word_count = (
+        sum(1 for word in non_stopword_words if NUMERIC_TOKEN_PATTERN.match(word))
+        if winning_matched_word_count > 0
+        else 0
+    )
     matched_signal_tokens = (
-        _matched_word_count(occurrences, winning_vertical)
+        winning_matched_word_count
         + _cue_word_count(non_stopword_words, winning_vertical)
         + numeric_word_count
     )

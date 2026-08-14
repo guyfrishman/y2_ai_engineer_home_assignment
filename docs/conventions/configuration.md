@@ -1,7 +1,8 @@
 # Configuration
 
 All configuration is environment-driven through a single typed settings
-object. No scattered `os.getenv` calls across the codebase.
+object, with one deliberate exception (below) — not scattered `os.getenv`
+calls across the codebase.
 
 ## `app/config.py`
 
@@ -42,6 +43,18 @@ Rules:
 | `CONFIDENCE_THRESHOLD` | Rule-path confidence at/above this skips the LLM fallback entirely |
 | `CACHE_TTL_SECONDS` / `CACHE_MAX_SIZE` | Full-response cache bounds |
 | `MAX_QUERY_LENGTH` | Sanitizer's soft truncation cap (the request schema also hard-rejects anything over 50,000 characters, before sanitization even runs) |
+
+## The one deliberate `os.getenv` exception
+
+`config.get_api_access_key()` reads `API_ACCESS_KEY` via `os.getenv` at call
+time instead of `settings.api_access_key`. Every other setting is read once
+at process start and never needs to change mid-run; this one does —
+`test_auth.py` toggles `API_ACCESS_KEY` per test via `monkeypatch.setenv`,
+and `settings` is a module-level singleton built once at import, so reading
+`settings.api_access_key` here would freeze whatever value was present at
+process start. `verify_api_key` calls this function per-request specifically
+so auth can be enabled/disabled live. See the function's docstring in
+`app/config.py` for the full rationale.
 
 ## Secrets
 

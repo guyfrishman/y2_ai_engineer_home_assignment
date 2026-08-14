@@ -48,6 +48,18 @@ instance is what the service layer imports:
 cache_repository: CacheRepository = InMemoryTTLCache()
 ```
 
+**In-flight request coalescing lives in `parse_service`, not here** — a
+`cache_key -> asyncio.Future` dict tracking requests that have missed the
+cache but haven't written a result yet. Without it, N identical requests
+arriving concurrently (a newly-popular query fanning out under real
+Zipfian traffic) would all miss the cache and all pay for their own LLM
+call — a stampede. The first caller for a key resolves normally; every
+concurrent duplicate awaits that same in-flight resolution instead of
+redoing the work, reported with its own `path="coalesced"` in metrics/logs
+so a fast coalesced wait is never conflated with a genuine fresh
+rules/LLM resolution. See `parse_service.parse_query` and
+`tests/test_parse_service.py`'s coalescing tests.
+
 **To swap the backing store** (Redis, Memcached), write a new class that
 implements `CacheRepository` and change that one construction line. No
 service or router changes.

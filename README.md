@@ -26,6 +26,9 @@ normalize (units, ranges, typo+fuzzy correction)
 cache lookup ──hit──────────────────────────────────► return  (p95  55ms measured)
    │ miss
    ▼
+identical request already in flight? ──yes──► await it, return  (path="coalesced")
+   │ no
+   ▼
 rule/dictionary classify + extract
    │
    ▼
@@ -80,13 +83,19 @@ curl http://localhost:8000/metrics
 ```
 
 ```bash
-cd api && uv run pytest                                              # 94 tests, no network, ~1.5s
+cd api && uv run pytest                                              # 99 tests, no network, ~1.5s
 cd api && uv run python ../scripts/loadtest.py --requests 200 --concurrency 20
 ```
 
 ## The honest finding: the model-path latency target isn't met
 
-Cache/rules p95 passes (≤150ms). The 600ms model-path target does not —
+Cache/rules p95 passes (≤150ms) at moderate concurrency, but **degrades to
+200-700ms under heavy concurrent real-LLM traffic** — still an open
+question as to the exact mechanism, though two plausible causes
+(`@log_activity`'s per-call logging overhead, and the classifier's
+per-request taxonomy-term scan) were profiled and measured, not assumed,
+and both ruled out as negligible (microseconds, not the hundreds of
+milliseconds observed). The 600ms model-path target fails outright —
 measured p95 well into multi-second territory against the real API, root
 caused (not just observed): Structured Outputs strict mode forces every
 optional field into the response as an explicit `null`, so a 20-28-field
@@ -95,8 +104,10 @@ how few fields the query actually needs. A controlled experiment
 confirmed the direction (dropping strict mode cut latency 56%) and why
 it's not adopted (validation collapsed to 12% — this nano-tier model
 doesn't reliably reproduce correct Hebrew object keys without constrained
-decoding). Full diagnosis, every number, and the write-behind architecture
-recommended as the real next step: **[`docs/requirements.md`](docs/requirements.md)**.
+decoding); a follow-up comparison against GPT-5-nano/mini confirmed the
+current model choice is still the best measured option. Full diagnosis,
+every number, and the write-behind architecture recommended as the real
+next step: **[`docs/requirements.md`](docs/requirements.md)**.
 
 This is on the front page deliberately — a README that only shows the
 numbers that pass isn't a credible one.
@@ -116,9 +127,10 @@ verified pricing, **$0.000410/request** for a Tier-1-only fallback,
 Even the conservative scenario is ~$2,100/month for 10M queries, because
 caching and the rule-first classifier mean the LLM only ever touches the
 minority of traffic. Levers implemented: full-response + word-level
-normalization caching, the rule-first classifier itself, two-tier
-escalation. Full breakdown and what's discussed-but-not-implemented (OpenAI
-prompt caching, embeddings-vs-rules): [`docs/infrastructure/cost-model.md`](docs/infrastructure/cost-model.md).
+normalization caching, in-flight request coalescing (N concurrent identical
+requests pay for one LLM call, not N), the rule-first classifier itself,
+two-tier escalation. Full breakdown and what's discussed-but-not-implemented
+(OpenAI prompt caching, embeddings-vs-rules): [`docs/infrastructure/cost-model.md`](docs/infrastructure/cost-model.md).
 
 ## Docs
 

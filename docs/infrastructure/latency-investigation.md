@@ -337,3 +337,46 @@ natural next comparison this round didn't cover is `gpt-5-mini` **with**
 showed mini meaningfully outperforms nano's Hebrew-key reliability even
 without constrained decoding, so mini *with* constrained decoding might
 beat G0 outright, at gpt-5-mini's higher per-token price.
+
+## Second ruled-out candidate for the cache/rules p95 degradation: the classifier hot path
+
+`classifier_service._scan_term_occurrences` scans the canonical query
+against every known taxonomy term (241 compiled regex patterns) on every
+rules-path request — O(number of taxonomy terms) per call, pure CPU, on
+the single-threaded event loop. A plausible-looking candidate for the
+still-unexplained cache/rules p95 degradation under load (200-700ms
+against a 150ms target, on a path with no network I/O): `@log_activity`
+was already ruled out, and this is the other real CPU-bound cost on that
+path.
+
+**Profiled before touching any code, per the instruction not to assume.**
+Isolated timing across the 8-query golden set (200 iterations per query,
+warm cache):
+
+| Measurement | Mean | p95 |
+|---|---|---|
+| `_scan_term_occurrences` alone | 0.107ms | 0.124ms |
+| Full rules pipeline (sanitize+normalize+classify+extract) | 0.140ms | 0.157ms |
+
+`_scan_term_occurrences` is ~96% of `classify_query`'s own cost, but
+`classify_query` itself is a rounding error next to the pipeline's other
+stages. Worst-case aggregate: even in the pathological case of 20
+concurrent requests all arriving simultaneously and serializing entirely
+behind each other on the GIL, total queueing across the whole batch is
+**~2.8ms** (20 × 0.14ms) — three orders of magnitude smaller than the
+200-700ms actually observed.
+
+**Conclusion: not the cause. Investigated and ruled out, not fixed** — no
+n-gram rewrite was implemented, since profiling shows there's no
+meaningful cost here to recover. Replacing a working, simple O(terms)
+scan with a more complex O(query_tokens × max_ngram) dictionary lookup
+would trade "boring and obvious" for a real engineering cost (correctness
+risk around the existing longest-match-wins and span-consumption
+semantics) to save microseconds nothing is waiting on.
+
+Two candidates are now ruled out (`@log_activity`, the classifier hot
+path); the actual mechanism behind the cache/rules degradation under
+concurrent LLM load remains an open question, still most likely
+infra-level contention (client connection pooling, or Docker Desktop's
+networking layer under sustained external call volume) rather than
+anything in this codebase's own CPU-bound work.

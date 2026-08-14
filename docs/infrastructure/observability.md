@@ -20,7 +20,7 @@ greppable separately from ordinary parsing-decision logs.
 | `parse_requests_total` | Counter | `category` (ASCII: `real_estate`/`vehicles`/`used_goods`) | Total requests per category — a required metric |
 | `parse_cache_result_total` | Counter | `result` (`hit`/`miss`) | Cache hit ratio — a required metric |
 | `parse_model_calls_total` | Counter | `tier` (`tier1`/`tier2`), `outcome` (`success`/`validation_failed`/`api_error`) | Model call success/failure rate — a required metric |
-| `parse_request_duration_seconds` | Histogram | `path` (`cache`/`rules`/`llm`) | p50/p95 latency — **per path**, not blended, so an SLA violation in one tier can't hide under a healthy aggregate |
+| `parse_request_duration_seconds` | Histogram | `path` (`cache`/`rules`/`llm`/`coalesced`/`error`) | p50/p95 latency — **per path**, not blended, so an SLA violation in one tier can't hide under a healthy aggregate |
 | `parse_tokens_total` | Counter | `model`, `token_type` (`prompt`/`completion`) | Token usage — a required metric |
 | `parse_cost_usd_total` | Counter | `model` | $/request — a required metric, computed from a verified pricing table (see `../infrastructure/cost-model.md`) |
 | `parse_errors_total` | Counter | — | Requests that raised mid-pipeline (see `parse_service.py`'s try/finally — latency is still recorded, under an `path="error"` bucket on the duration histogram, even when a request fails) |

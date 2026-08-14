@@ -14,7 +14,7 @@ repo — there's no separate UI or worker.
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| `POST` | `/parse` | `X-API-Key` (no-op if `API_ACCESS_KEY` unset) | Parse a Hebrew query. Body: `{"q": "<text>"}`. Returns `{category, params, confidence, notes}`. Sets an `X-Parse-Path` response header (`cache`/`rules`/`llm`) — observability only, not part of the JSON contract. |
+| `POST` | `/parse` | `X-API-Key` (no-op if `API_ACCESS_KEY` unset) | Parse a Hebrew query. Body: `{"q": "<text>"}`. Returns `{category, params, confidence, notes}`. Sets an `X-Parse-Path` response header (`cache`/`rules`/`llm`/`coalesced` — the last when an identical request was already in flight, see `docs/conventions/repositories.md`) — observability only, not part of the JSON contract. |
 | `GET` | `/health` | open | Liveness probe; also reports `taxonomy_version`. |
 | `GET` | `/metrics` | open | Prometheus exposition — HTTP-level (via `prometheus-fastapi-instrumentator`) plus custom pipeline counters/histograms (see `docs/infrastructure/observability.md`). |
 
@@ -48,7 +48,7 @@ api/
 │   │   └── parse_service.py               # orchestrates the full pipeline
 │   └── routers/
 │       ├── api.py, search.py, ping.py
-└── tests/                     # 88 tests, no network — see docs/conventions/testing.md
+└── tests/                     # 99 tests, no network — see docs/conventions/testing.md
 ```
 
 Follows the repo conventions — [routers](../conventions/routers.md),
@@ -134,19 +134,25 @@ docker compose up --build
   flight) model-path p95 climbed further — consistent with
   queuing/throttling under burst concurrent traffic from one API key — and
   the cache/rules path's own p95 also degraded in the same runs (200-700ms
-  across several, despite doing no network I/O). One candidate cause was
-  tested directly: `@log_activity` (a `json.dumps` + recursive truncation
-  on every function call) was removed entirely as part of the logging
-  rewrite (`docs/conventions/logging.md`), and the same loadtest re-run at
-  the same concurrency showed **no improvement** — cache/rules p95 was
-  still 200-700ms. Across three runs total, cache-only traffic (no
-  concurrent LLM calls) was consistently fast (~50ms); any run with real
-  concurrent LLM traffic showed the degradation, with or without
-  `@log_activity`. That rules out the logging decorator as the cause and
-  points toward infra-level contention (client connection pooling, or
-  Docker Desktop's networking layer under sustained external call volume)
-  instead — not isolated further than that, but no longer an open question
-  about *whether* logging was responsible.
+  across several, despite doing no network I/O). Two candidate causes were
+  tested directly, not assumed. `@log_activity` (a `json.dumps` + recursive
+  truncation on every function call) was removed entirely as part of the
+  logging rewrite (`docs/conventions/logging.md`), and the same loadtest
+  re-run at the same concurrency showed **no improvement** — cache/rules
+  p95 was still 200-700ms. `classifier_service._scan_term_occurrences`
+  (O(number of taxonomy terms) — 241 regex patterns checked per query) was
+  profiled in isolation: ~0.11ms per call, ~0.14ms for the full
+  sanitize→normalize→classify→extract pipeline; even 20 requests
+  serializing entirely behind each other on the GIL is only ~2.8ms of
+  aggregate queueing — three orders of magnitude short of what's observed,
+  so no rewrite was made. Across three loadtest runs total, cache-only
+  traffic (no concurrent LLM calls) was consistently fast (~50ms); any run
+  with real concurrent LLM traffic showed the degradation regardless of
+  either candidate. That rules out both as the cause and points toward
+  infra-level contention (client connection pooling, or Docker Desktop's
+  networking layer under sustained external call volume) instead — not
+  isolated further than that, but two "it's this code" explanations are
+  now tested and rejected, not live ones.
 
   The credible paths to closing the core gap, not yet implemented: (1)
   scope the `יד_שנייה` schema to just the rule path's candidate

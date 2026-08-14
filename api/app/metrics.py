@@ -29,7 +29,7 @@ PARSE_MODEL_CALLS_TOTAL = Counter(
 # hide an SLA violation in one tier (e.g. the LLM path creeping past 600ms)
 # under a healthy-looking aggregate average.
 PARSE_REQUEST_DURATION_SECONDS = Histogram(
-    "parse_request_duration_seconds", "Request latency by resolution path", ["path"]  # cache | rules | llm
+    "parse_request_duration_seconds", "Request latency by resolution path", ["path"]  # cache | rules | llm | coalesced | error
 )
 
 PARSE_TOKENS_TOTAL = Counter(
