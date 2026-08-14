@@ -1,8 +1,8 @@
 # LLM Usage
 
-This is **not** the provider-agnostic chat-loop pattern a generic AI
-template ships with. There's no conversation, no session history, and the
-provider is fixed to OpenAI by design — see
+`/parse` is a single-shot extraction endpoint, not a conversational one:
+there's no chat loop, no conversation history, and the provider is fixed
+to OpenAI by design — see
 [`../decisions/0002-openai-specific-repository.md`](../decisions/0002-openai-specific-repository.md).
 What follows is the fallback-tier usage pattern this service actually uses.
 

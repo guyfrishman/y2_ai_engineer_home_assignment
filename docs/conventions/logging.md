@@ -92,10 +92,10 @@ that would otherwise become a 500) produces a `request_error` line.
 
 ## Why `@log_activity` (a decorator on every function) was removed
 
-The template this service is modeled on decorates every handler, service,
-and repository method, emitting a `STARTING`/`FINISHED` (or `ERROR`) pair
-per call. That's roughly 15-20 log lines for a single successful `/parse`
-request here — several of them logging the same session/trace context
+An earlier design decorated every handler, service, and repository
+method, emitting a `STARTING`/`FINISHED` (or `ERROR`) pair per call.
+That's roughly 15-20 log lines for a single successful `/parse`
+request — several of them logging the same session/trace context
 redundantly, most of them duplicating latency and error-rate data
 Prometheus already aggregates correctly (percentiles, rates) in a way a
 log line can't. At 10M queries/month that's a real, avoidable volume cost,
@@ -122,16 +122,16 @@ load" theory didn't hold up and isn't claimed here.
 
 ## What was also removed, and why
 
-- **`session_id`.** Inherited from the chat-app template this service is
-  modeled on, where it identified a conversation. `/parse` is stateless —
-  there's no session — so it logged `"n/a"` on every single line. Gone
-  from the `ContextVar`, the log output, and this doc.
+- **`session_id`.** Carried over from an early conversational design,
+  where it identified a chat session. `/parse` is stateless — there's no
+  session — so it logged `"n/a"` on every single line. Gone from the
+  `ContextVar`, the log output, and this doc.
 - **Per-function decoration generally.** See above.
 
 ## Don'ts
 
 - **Don't** use `print(...)`.
-- **Don't** use the stdlib `logging` module directly — use `app.logger`.
+- **Don't** use the stdlib `logging` module directly — use `logger.py`'s `log_event`.
 - **Don't** log secrets. `log_event` truncates long values
   (`settings.max_str_log_length`, default 200 chars) but does not redact —
   `OPENAI_API_KEY` is read directly from `settings` inside
@@ -142,8 +142,8 @@ load" theory didn't hold up and isn't claimed here.
 
 ## `LOG_LEVEL` and `MAX_STR_LOG_LENGTH`
 
-Both read from `app.config.settings` (`settings.log_level`,
+Both read from `config.settings` (`settings.log_level`,
 `settings.max_str_log_length`), not `os.getenv` directly — see
 [configuration.md](configuration.md). `logger.py` importing from
-`app.config` (and not the reverse) is what keeps this import-cycle-free;
-`config.py` has no reason to import `app.logger` and doesn't.
+`config` (and not the reverse) is what keeps this import-cycle-free;
+`config.py` has no reason to import `logger.py` and doesn't.

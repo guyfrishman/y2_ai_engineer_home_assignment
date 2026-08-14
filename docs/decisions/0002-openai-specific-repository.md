@@ -3,12 +3,11 @@
 **Decision:** `y2_ai_search_api/repositories/openai_repository.py` defines
 `OpenAIRepository`, a concrete class built on `openai.AsyncOpenAI` — not an
 `LlmRepository` interface with a swappable, base-URL-configurable
-implementation. This is a deliberate deviation from
-`docs/conventions/repositories.md`'s general provider-agnostic pattern for
-model clients. If multi-provider support is ever needed, the fix is to
-introduce an `LlmRepository` interface with `OpenAIRepository` as one
-implementation behind it — not to bolt `OPENAI_BASE_URL` configuration back
-onto this class.
+implementation. This service only ever calls OpenAI, so there's no
+provider-agnostic abstraction to build here. If multi-provider support is
+ever needed, the fix is to introduce an `LlmRepository` interface with
+`OpenAIRepository` as one implementation behind it — not to bolt
+`OPENAI_BASE_URL` configuration back onto this class.
 
 **Why:** The assignment brief pins the provider ("Use environment
 variables/config for API keys" — for OpenAI specifically — with no

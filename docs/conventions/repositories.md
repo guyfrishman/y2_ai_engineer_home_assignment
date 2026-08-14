@@ -84,11 +84,13 @@ service or router changes.
 
 ### `OpenAIRepository` — OpenAI-specific, not provider-agnostic
 
-`y2_ai_search_api/repositories/openai_repository.py` wraps `openai.AsyncOpenAI`. Unlike
-a typical template's provider-agnostic `LlmRepository`, this class is named
-and shaped for OpenAI specifically — see
+`y2_ai_search_api/repositories/openai_repository.py` wraps `openai.AsyncOpenAI`.
+This service only ever calls OpenAI, so the class is named and shaped for
+that specifically — not a provider-agnostic `LlmRepository` interface,
+which would be unused generality for a provider this service will never
+swap out. See
 [`../decisions/0002-openai-specific-repository.md`](../decisions/0002-openai-specific-repository.md)
-for why that's a deliberate choice here, not an oversight.
+for the full reasoning.
 
 It exposes `chat(...)` (returns the raw response — callers need
 `.choices[0].logprobs` and `.usage`, not just the text) and `embed(...)`.

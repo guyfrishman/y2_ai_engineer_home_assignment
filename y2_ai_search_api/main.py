@@ -32,10 +32,10 @@ async def trace_id_middleware(request: Request, call_next):
 
 
 # /health is open (liveness/readiness probe). /parse sits behind the API
-# key (a no-op when API_ACCESS_KEY is unset — see app/security.py).
+# key (a no-op when API_ACCESS_KEY is unset — see security.py).
 app.include_router(ping_router)
 app.include_router(api_router, dependencies=[Depends(verify_api_key)])
 
 # Adds GET /metrics, open, alongside HTTP-level request/status/latency
-# instrumentation. Custom pipeline metrics live in app/metrics.py.
+# instrumentation. Custom pipeline metrics live in metrics.py.
 Instrumentator().instrument(app).expose(app)
