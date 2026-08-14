@@ -94,21 +94,56 @@ def _force_strict_ref_or_node(node: dict, defs: dict) -> None:
     _force_strict_recursive(node, defs)
 
 
+def _scoped_strict_json_schema(model_class: type[BaseModel], already_known_fields: frozenset[str]) -> dict:
+    """Same strict schema as _strict_json_schema, restricted to the
+    top-level fields the rule path didn't already fill — measured to cut
+    ~8% completion tokens and ~12% latency with no validation cost (see
+    docs/infrastructure/latency-investigation.md's schema-scoping section).
+    The LLM is only asked to fill gaps rules couldn't; already-known fields
+    are merged back in after the call in _call_tier, and the merged result
+    is validated against the FULL, unscoped model there — this narrows what
+    the model is asked to produce, never what's allowed through validation.
+
+    Not cached (already_known_fields varies per request, unlike
+    _strict_json_schema's fixed one-per-vertical inputs) — built by
+    filtering a copy of the cached full schema, so it stays cheap. Falls
+    back to the full schema if every field is already known (nothing left
+    to scope down to) rather than sending OpenAI an empty properties dict.
+    """
+    full_schema = _strict_json_schema(model_class)
+    scoped_properties = {
+        name: spec for name, spec in full_schema["properties"].items() if name not in already_known_fields
+    }
+    if not scoped_properties:
+        return full_schema
+    return {
+        **full_schema,
+        "properties": scoped_properties,
+        "required": [name for name in full_schema["required"] if name not in already_known_fields],
+    }
+
+
 async def _call_tier(
-    vertical: Vertical, canonical_query: str, model_name: str, tier_label: str
-) -> tuple[BaseModel, list] | tuple[None, None]:
-    """Returns (validated_params, token_logprobs) on success, or (None, None)
-    on api_error or required-field validation failure — both logged as
-    security_llm_validation_failed so they're greppable separately from
-    normal request logs."""
+    vertical: Vertical, canonical_query: str, model_name: str, tier_label: str, rule_path_params: BaseModel
+) -> tuple[BaseModel, list, dict] | tuple[None, None, None]:
+    """Returns (validated_params, token_logprobs, llm_returned_fields) on
+    success, or (None, None, None) on api_error or required-field
+    validation failure — both logged as security_llm_validation_failed so
+    they're greppable separately from normal request logs.
+
+    llm_returned_fields is what the model itself generated, before merging
+    in the rule path's already-known fields — the confidence calc scores
+    the model's own answer, not fields it was never asked to produce."""
     model_class = taxonomy_repository.params_models[vertical]
+    already_known_fields = frozenset(rule_path_params.model_dump(exclude_none=True).keys())
+    scoped_schema = _scoped_strict_json_schema(model_class, already_known_fields)
     messages = [
         {"role": "system", "content": build_extraction_system_prompt(vertical)},
         {"role": "user", "content": canonical_query},
     ]
     response_format = {
         "type": "json_schema",
-        "json_schema": {"name": "search_params", "schema": _strict_json_schema(model_class), "strict": True},
+        "json_schema": {"name": "search_params", "schema": scoped_schema, "strict": True},
     }
 
     try:
@@ -122,18 +157,25 @@ async def _call_tier(
     except OpenAIUnavailableError as error:
         log_event(event="security_llm_validation_failed", tier=tier_label, outcome="api_error", reason=str(error))
         PARSE_MODEL_CALLS_TOTAL.labels(tier=tier_label, outcome="api_error").inc()
-        return None, None
+        return None, None, None
 
     raw_content = response.choices[0].message.content or "{}"
     try:
-        raw_params = json.loads(raw_content)
+        llm_returned_fields = json.loads(raw_content)
     except json.JSONDecodeError:
         log_event(event="security_llm_validation_failed", tier=tier_label, outcome="validation_failed", reason="invalid_json")
         PARSE_MODEL_CALLS_TOTAL.labels(tier=tier_label, outcome="validation_failed").inc()
-        return None, None
+        return None, None, None
 
+    # Validation always runs against the FULL, unscoped taxonomy model, on
+    # the merged result — a field the LLM was never even asked about still
+    # has to satisfy every constraint a model-derived field would. Scoping
+    # narrows what's asked for on the wire; it never narrows what's
+    # accepted. See tests/test_llm_fallback_service.py's
+    # test_scoped_schema_validates_the_merged_result_against_the_full_model.
+    merged_fields = {**rule_path_params.model_dump(exclude_none=True), **llm_returned_fields}
     try:
-        validated_params = model_class(**raw_params)
+        validated_params = model_class(**merged_fields)
     except ValidationError as error:
         log_event(
             event="security_llm_validation_failed",
@@ -142,34 +184,32 @@ async def _call_tier(
             reason=str(error)[:200],
         )
         PARSE_MODEL_CALLS_TOTAL.labels(tier=tier_label, outcome="validation_failed").inc()
-        return None, None
+        return None, None, None
 
     log_event(event="llm_call_outcome", tier=tier_label, outcome="success", model=model_name)
     PARSE_MODEL_CALLS_TOTAL.labels(tier=tier_label, outcome="success").inc()
     token_logprobs = response.choices[0].logprobs.content if response.choices[0].logprobs else []
-    return validated_params, token_logprobs
+    return validated_params, token_logprobs, llm_returned_fields
 
 
 async def run_llm_fallback(
     vertical: Vertical, canonical_query: str, rule_path_params: BaseModel
 ) -> LlmFallbackResult:
-    tier1_params, tier1_logprobs = await _call_tier(
-        vertical, canonical_query, settings.openai_fallback_model, "tier1"
+    tier1_params, tier1_logprobs, tier1_llm_fields = await _call_tier(
+        vertical, canonical_query, settings.openai_fallback_model, "tier1", rule_path_params
     )
     if tier1_params is not None:
-        present_fields = list(tier1_params.model_dump(exclude_none=True).keys())
         confidence = await compute_llm_confidence(
-            canonical_query, tier1_logprobs, present_fields, tier1_params.model_dump(exclude_none=True)
+            canonical_query, tier1_logprobs, list(tier1_llm_fields.keys()), tier1_params.model_dump(exclude_none=True)
         )
         return LlmFallbackResult(params=tier1_params, confidence=confidence, tier_used="tier1")
 
-    tier2_params, tier2_logprobs = await _call_tier(
-        vertical, canonical_query, settings.openai_escalation_model, "tier2"
+    tier2_params, tier2_logprobs, tier2_llm_fields = await _call_tier(
+        vertical, canonical_query, settings.openai_escalation_model, "tier2", rule_path_params
     )
     if tier2_params is not None:
-        present_fields = list(tier2_params.model_dump(exclude_none=True).keys())
         confidence = await compute_llm_confidence(
-            canonical_query, tier2_logprobs, present_fields, tier2_params.model_dump(exclude_none=True)
+            canonical_query, tier2_logprobs, list(tier2_llm_fields.keys()), tier2_params.model_dump(exclude_none=True)
         )
         return LlmFallbackResult(params=tier2_params, confidence=confidence, tier_used="tier2")
 

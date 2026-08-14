@@ -76,6 +76,40 @@ response field.
 
 ## Future direction: write-behind / optimistic degrade (not implemented)
 
+### The conclusion, stated plainly: 600ms is not reachable by optimizing the call further
+
+This isn't a guess or a concession made after running out of ideas — it's
+what the measurements in `docs/infrastructure/latency-investigation.md`
+actually show, across every lever tried. A real streaming call decomposed
+the ~2.6-3.5s Tier 1 latency directly: time-to-first-token alone is
+300-1,700ms depending on connection warmth, and doesn't collapse to
+near-zero even on an already-warm connection to OpenAI — a genuine floor
+from prefill (processing the ~3,500-token prompt) plus whatever setup
+Structured Outputs' constrained decoding needs before the first
+grammar-valid token, not a cost this codebase's request handling
+controls. Schema scoping (asking the model only for fields the rule path
+couldn't already fill) was implemented and measured a real, adopted
+8-12% improvement in tokens and latency — and that is nowhere close to
+the roughly 80% reduction the 600ms target would need, because the
+dominant cost doesn't scale with excluded field count the way it scales
+with prompt/schema complexity. Dropping strict-mode Structured Outputs
+entirely was tested earlier and rejected on correctness grounds (a
+56%-faster variant collapsed Hebrew-key validity from 100% to 12%), so
+that lever is closed too, not merely unexplored.
+
+**The engineering conclusion this supports:** for a synchronous,
+constrained-decoding call against a schema this size, on models at this
+price tier, 600ms is not an achievable target by further optimizing the
+call itself — every lever that could plausibly move the number has now
+been tried, measured, and either adopted (schema scoping) or rejected on
+correctness grounds (dropping strict mode). The correct response to a
+target that measurement shows is architecturally out of reach for a
+given approach is to change the approach, not to keep spending effort
+narrowing a gap that levers within the current design can't close. That
+is exactly what write-behind, below, does: it doesn't try to make the
+call faster — it changes *whether the request has to wait for the call
+at all*.
+
 The measured LLM-fallback latency (`docs/infrastructure/latency-investigation.md`:
 ~2.6s for an isolated Tier 1 call alone, before any escalation) means the
 600ms model-path target isn't reachable by making the model call faster

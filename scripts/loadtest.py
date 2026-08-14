@@ -144,6 +144,25 @@ def _build_query_plan_with_llm_ratio(total_requests: int, llm_ratio: float) -> l
     return combined
 
 
+async def _warm_up_connection_pool(client: httpx.AsyncClient, concurrency: int) -> None:
+    """Establish `concurrency` concurrent connections against /health before
+    the timed portion of the test starts.
+
+    Without this, the first ~`concurrency` requests of any run pay a
+    one-time cost to open that many new TCP connections at once -- measured
+    at 200-290ms per request in this project's investigation (see
+    docs/infrastructure/latency-investigation.md's connection-pool-warmup
+    finding), entirely unrelated to request handling. Every prior loadtest
+    run created a fresh httpx.AsyncClient (cold pool) *and* usually hit a
+    freshly-restarted server, so this cost was silently re-measured as if
+    it were a real cache/rules p95 SLA violation on every single run. A real
+    client in production pays this cost once at startup, not per burst --
+    warming up here is what makes the timed measurement represent steady-
+    state performance instead of connection-establishment overhead.
+    """
+    await asyncio.gather(*(client.get("/health") for _ in range(concurrency)))
+
+
 async def run_loadtest(
     base_url: str, total_requests: int, concurrency: int, llm_ratio: float | None = None
 ) -> LoadTestResults:
@@ -155,6 +174,7 @@ async def run_loadtest(
     semaphore = asyncio.Semaphore(concurrency)
 
     async with httpx.AsyncClient(base_url=base_url, timeout=30.0) as client:
+        await _warm_up_connection_pool(client, concurrency)
         started_at = time.perf_counter()
         outcomes = await asyncio.gather(*(_send_one(client, query, semaphore) for query in query_plan))
         wall_clock_seconds = time.perf_counter() - started_at

@@ -93,6 +93,14 @@ architecturally free.
   Outputs and logprobs) handles the large majority; Tier 2
   (`gpt-4.1-mini`) only runs on Tier 1's actual validation failures (~15%
   of fallback traffic in this measurement).
+- **Schema scoping** (`llm_fallback_service._scoped_strict_json_schema`)
+  — the wire schema on a fallback call only asks for fields the rule path
+  didn't already fill, not the full per-vertical field set. Measured on
+  the golden query set: **-8% completion tokens** per fallback call (a
+  direct, proportional cost reduction on top of the levers above), with a
+  *higher*, not lower, validation pass rate. See
+  `docs/infrastructure/latency-investigation.md`'s schema-scoping section
+  for the full experiment.
 
 **Falls out of the design for free, not separately implemented:**
 - **Prompt compression via OpenAI's automatic prompt caching.** The system

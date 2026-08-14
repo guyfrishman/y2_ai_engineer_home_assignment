@@ -79,6 +79,17 @@ measurably lower score than an equivalent completion with confident values,
 while the surrounding structure is held identical — confirming the
 isolation actually works, not just that the formula runs.
 
+Since schema scoping (`docs/infrastructure/latency-investigation.md`'s
+schema-scoping section) narrows the wire schema to fields the rule path
+didn't already fill, the "present fields" passed to this function are the
+model's own returned fields specifically (`llm_returned_fields` in
+`llm_fallback_service.run_llm_fallback`), not the full merged result. A
+field the rule path already knew was never in the completion text at all
+— scoring it here would just fail to find its span and get silently
+skipped, which happens to be harmless, but isn't the point: this score
+should reflect the model's own confidence in what *it* generated, not
+dilute that signal with fields it was never asked about.
+
 ## The embedding cross-check
 
 A model can be high-confidence about a wrong extraction — logprobs alone

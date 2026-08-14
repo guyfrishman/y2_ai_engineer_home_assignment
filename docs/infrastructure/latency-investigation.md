@@ -618,6 +618,229 @@ co-located inside the Docker network) than this investigation had
 available, and is recorded here as the concrete next step, not left
 unstated.
 
+## Resolved: the cache/rules p95 degradation is a cold-connection-pool artifact, not a network, infra, or code problem
+
+The five candidates above were all infra/networking hypotheses, and all
+five came back negative. That redirected the investigation: not "which
+layer of the network stack is slow," but "why does the client-observed
+latency for a request the server itself processes in under a millisecond
+split into two distinct groups at all." Answering that directly resolved
+the open question.
+
+**A minimal control app — zero lines of this project's code — reproduces
+the exact same bimodal pattern.** A bare FastAPI app with two routes
+(`/fast` returning instantly, `/slow` doing `await asyncio.sleep(2.6)`
+— no cache, no classifier, no OpenAI client, no middleware) driven by
+the same concurrency-20 semaphore-limited `httpx` client pattern
+`loadtest.py` uses: **18/129 `/fast` requests clustered tightly at
+280-287ms**, the rest at 6-8ms. This conclusively rules out every piece
+of this codebase (cache, classifier, confidence calc, middleware,
+`OpenAIRepository`) as the cause — the artifact exists with none of it
+present.
+
+**Nagle's algorithm was the obvious next suspect and was refuted by
+reading the actual stdlib source, not assumed.** `asyncio`'s own
+`selector_events.py` (Linux) and `proactor_events.py` (Windows) both call
+`base_events._set_nodelay()` on every socket transport they create,
+disabling Nagle by default — confirmed directly in CPython's source, on
+both the client and server side. There was no Nagle+delayed-ACK
+interaction to interact with in the first place.
+
+**Correlating client and server wall-clock timestamps for the same
+delayed requests pinpointed exactly where the time goes.** For every
+"stuck" request: server-side handler execution was **0.000ms**, response
+transmission back to the client was **1-4.5ms**, and the entire ~280ms
+sat in the gap between the client entering the request and the server's
+handler starting to run. And critically: the IDs of every delayed request
+were **exactly 0 through 17** — the first 18 fast requests submitted, by
+creation order, and none of the other 111. Not scattered, not correlated
+with which requests happened to run concurrently with a slow one — just
+the first ~20 (matching the concurrency limit exactly).
+
+**That pattern is the signature of a one-time cost paid by the first
+wave of concurrent requests, not sustained contention.** Confirmed
+directly: running the same fast+slow mix **twice** against the same
+`httpx.AsyncClient` (no restart) showed clustering only on the *first*
+round (18/129 >100ms) — the second and third rounds, same client, same
+server, same traffic mix, were completely clean (p95 36-47ms, 0 stuck).
+And critically, the effect appears even with **zero slow requests at
+all** — a pure-fast, 129-request cold-pool run also shows ~20 requests
+stuck at ~289ms. It was never about slow LLM requests contending with
+fast ones; it's the cost of establishing ~20 concurrent brand-new TCP
+connections at once from an empty connection pool, on this machine,
+regardless of what those connections are for.
+
+**This transfers directly to the real application.** The same
+warm-vs-cold test against the actual service: a cold client hitting a
+freshly-restarted container failed the SLA (cache/rules p95 205.8ms); the
+same client, still warm, immediately after, against the same server,
+passed cleanly (p95 63.0ms). Every "degraded" measurement in this
+investigation and the previous round used a fresh `httpx.AsyncClient`
+per `loadtest.py` invocation — meaning **every single p95 "violation"
+measured throughout both investigation rounds was substantially
+re-measuring this one-time connection-establishment cost**, not a
+sustained property of the running service.
+
+**A wrinkle: a cheap warm-up doesn't fully close the gap on the real
+app, and that gap is itself informative.** Pre-warming the connection
+pool with 20-40 concurrent `GET /health` calls (near-instant, ~45ms
+total) reduces but doesn't eliminate the effect on the real service
+(still ~20-25/129 requests over 100ms, down from ~26-29 but not zero).
+Pre-warming with a small batch that includes at least one **genuine**
+LLM-path call — real network I/O to OpenAI, not a loopback sleep — gets
+cache/rules p95 to 100-129ms, passing the target, with only a handful of
+residual outliers. That gap between "any 20 connections" and
+"specifically including a real slow request" points to a second, smaller,
+real-app-specific one-time cost layered on top of the generic TCP-burst
+artifact — plausibly `AsyncOpenAI`'s first real DNS resolution and TLS
+handshake to OpenAI's servers (unlike the pure-loopback minimal repro,
+this app's slow path makes a real external connection), or the
+`functools.lru_cache`-wrapped `_strict_json_schema()` building each
+vertical's schema for the first time. Not isolated further within this
+session's budget — recorded here as the concrete next step rather than
+guessed at.
+
+**Fixed in `scripts/loadtest.py`:** `run_loadtest` now warms the
+connection pool (`concurrency` concurrent `GET /health` calls) before the
+timed portion of any run starts, so a fresh loadtest invocation no longer
+silently re-measures pure connection-establishment overhead as if it were
+request-handling latency. Given the finding above, this warm-up is a
+partial, not complete, fix for the *tool's* measurement — real
+steady-state latency is better represented if a run has already sent
+at least one real LLM-path request before the numbers that matter are
+recorded.
+
+**Practical implication, and where this leaves the honest SLA read:**
+this is not "no problem exists" — a genuinely cold service (a fresh
+deploy, a fresh autoscaled replica) really will show elevated latency on
+its first burst of concurrent traffic, cache/rules path included, until
+its connection pool and OpenAI-facing warm-up cost are paid once. But it
+is **not** the sustained, request-volume-scaling degradation the earlier
+"200-700ms under heavy concurrent LLM traffic" framing implied, and it is
+**not** caused by this codebase's request-handling, the cache, the
+classifier, Docker, WSL2, or the network. The concrete production
+recommendation this points to: a real deployment should exercise at
+least one request through each code path (rules and LLM) during startup,
+before accepting traffic — a standard "warm-up request" pattern, not a
+code fix to the service itself.
+
+## Track B: the LLM call itself — decomposed, and one real optimization adopted
+
+Track A (above) resolved the cache/rules-path mystery. This track returns
+to the still-unmet 600ms model-path target and asks two focused
+questions: where inside a single ~2.6s Tier 1 call does the time actually
+go, and does scoping the wire schema down help.
+
+### B1. Time-to-first-token vs. generation rate, via a real streaming call
+
+A non-streaming call only reports total latency — it can't distinguish
+"the model took a long time to start responding" from "the model
+responded promptly but took a long time to finish." A real streaming
+Tier 1 call (`stream=True`, same schema, same model, same live API)
+separates the two directly.
+
+**First call, cold:**
+
+| Phase | Measured |
+|---|---|
+| Time-to-first-token (TTFT) | **1,666.6ms** |
+| Generation (first → last token, 212 chunks) | 1,878.3ms (~113 chunks/sec) |
+| Total | 3,544.9ms |
+
+**TTFT is the majority of the call, not the generation phase** — the
+model (or the request pipeline in front of it) spends more time producing
+*nothing* than it spends producing the actual ~450-character response.
+Per the task's own framing: a TTFT this large (>>300ms) raises the
+question of whether Track A and Track B share a root cause, and it's
+worth checking directly rather than assumed away.
+
+**Three more calls, same already-open client (warm connection):**
+
+| Call | TTFT | Total | Chunks |
+|---|---|---|---|
+| 1 (still effectively cold — first real call of this process) | 767.6ms | 1,932.5ms | 208 |
+| 2 | 358.8ms | 1,463.3ms | 202 |
+| 3 | 493.9ms | 1,642.6ms | 204 |
+
+**TTFT drops substantially on a warm connection (767ms → 359-494ms,
+roughly 40-55%) but does not disappear.** This is a genuine partial
+overlap with Track A's finding: some of TTFT is connection/TLS-handshake
+cost to OpenAI's real servers, paid once and amortized on reuse, exactly
+like the loopback connection-burst cost Track A found — but a substantial
+floor (300-500ms) remains even fully warm. That floor isn't explained by
+connection state; it's the model's own prefill cost (processing the
+~3,500-token system prompt + schema) plus whatever setup Structured
+Outputs' constrained decoding needs before it can emit the first
+grammar-valid token — a cost intrinsic to the request, not fixable by
+warming anything up.
+
+**Conclusion: TTFT, not generation speed, is the dominant and most
+promising lever left** — generation itself (~110-180 chunks/sec measured
+here, broadly consistent with this project's earlier ~70 tokens/sec
+estimate from a different, non-streaming measurement) is not obviously
+throttled. But the warm-connection floor (300-500ms) means even a
+perfectly warmed-up, schema-optimized call has a real prefill cost this
+investigation did not find a lever for within budget — consistent with
+the B3 conclusion below.
+
+### B2. Schema scoping — measured, and adopted
+
+**The idea:** the LLM only needs to fill fields the rule path's own
+(sub-threshold) extraction left empty — not re-derive fields already
+known deterministically. Build the Structured Outputs schema from just
+the unfilled subset instead of the full 20-28-field model, merge the
+rule path's already-known fields back into the LLM's response, and
+validate the *merged* result against the *full*, unscoped taxonomy model
+— scoping narrows what's asked for on the wire, never what's allowed
+through.
+
+**Measured against the golden query set** (8 queries across all 3
+verticals, real Tier 1 calls, same model/settings both variants):
+
+| | Baseline (full schema) | Scoped (gap fields only) | Delta |
+|---|---|---|---|
+| Avg latency | 1,512ms | 1,337ms | **-11.6%** |
+| Avg completion tokens | 187 | 172 | **-8.1%** |
+| Validation pass rate | 62% (5/8) | 75% (6/8) | **improved, not degraded** |
+
+Per-query, the fields actually excluded from the wire schema were small
+(the rule path typically already has 1-3 fields right even below
+threshold) — e.g. 28→25, 20→16, 28→27 — so this is a modest, not
+dramatic, token/latency win. The validation-pass-rate improvement (n=8,
+not large enough to be a tight confidence interval, but directionally
+consistent with the mechanism) makes sense structurally: fewer fields for
+the model to get wrong, and the fields it doesn't have to touch (already
+correct, from the deterministic rule path) can't introduce a mistake.
+
+**Per the task's own decision rule** (adopt if it doesn't degrade
+validation; report and don't adopt if it does): this is a clean win on
+every axis measured, not a trade-off to weigh. **Adopted** —
+`llm_fallback_service.py`'s `_call_tier` now builds a scoped schema per
+call (`_scoped_strict_json_schema`, falling back to the full schema in
+the edge case where the rule path already has every field), merges the
+LLM's response with the rule path's known fields, and validates the
+merge against the full model. Confidence scoring was updated alongside
+it: `compute_llm_confidence`'s logprob signal now scores only the fields
+the model itself generated (`llm_returned_fields`), not the merged
+result — scoring a field the model was never asked about would silently
+find nothing in the raw completion text and skip it, which happens to be
+harmless but isn't the intent; the embedding cross-check still uses the
+full merged params, since that's the complete answer being sanity-checked
+semantically. Regression tests: `tests/test_llm_fallback_service.py`'s
+`test_scoped_schema_narrows_what_is_asked_not_what_is_allowed` (proves
+merging-then-validating-against-the-full-model actually happens, using
+the sector/subcategory cross-field validator as the one check that only
+fires on the complete object), `test_scoped_schema_excludes_already_known_fields_from_the_wire_schema`,
+and `test_scoped_schema_falls_back_to_the_full_schema_when_nothing_is_left_to_scope`.
+
+**Why this doesn't close the 600ms gap on its own:** an 8-12% reduction
+on a ~2.6-3.5s call is real money and a real, if modest, latency
+improvement — not a fix for a target that needs roughly an 80% reduction.
+B1's finding explains why: the dominant cost is TTFT (prefill +
+constrained-decoding setup), which scales with prompt/schema *complexity*
+more than a handful of excluded fields meaningfully changes, not with
+completion length alone.
+
 ### A real bug found along the way, unrelated to the p95 question: cancelling the resolving request could hang coalesced waiters forever
 
 Reviewing shutdown behavior for `parse_service.py`'s in-flight request

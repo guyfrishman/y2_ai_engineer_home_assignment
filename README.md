@@ -89,23 +89,28 @@ cd y2_ai_search_api && uv run python ../scripts/loadtest.py --requests 200 --con
 
 ## The honest finding: the model-path latency target isn't met
 
-Cache/rules p95 passes (≤150ms) at moderate concurrency, but **degrades to
-200-700ms under heavy concurrent real-LLM traffic** — still an open
-question as to the exact mechanism, though seven plausible causes across
-two investigation rounds were profiled and measured, not assumed, and all
-seven ruled out as the cause: `@log_activity`'s per-call logging overhead,
-the classifier's per-request taxonomy-term scan, raw CPU/memory
-saturation, uvicorn backlog/keep-alive tuning, the OpenAI client's
-connection-pool size, and — the biggest lever tried — 3x replica capacity
-behind a real load balancer. What *is* confirmed: the stall only appears
-with concurrent LLM-path traffic present (a direct A/B test: 0/144 vs.
-26/129 requests over 100ms at identical concurrency), and it clusters
-tightly around one latency value rather than spreading out — the
-signature of a shared blocking resource, most likely infrastructure every
-replica sits behind alike (the Docker Desktop WSL2 network layer between
-this project's test client and its containers), not this codebase's own
-request-handling. Full methodology, every number, and what a follow-up
-would need: `docs/infrastructure/latency-investigation.md`. The 600ms
+Cache/rules p95 passes (≤150ms) at steady state, but **a fresh, cold
+client hitting a freshly-started instance can see 200-700ms on its first
+burst of concurrent traffic** — resolved, not left as an open question.
+Seven infra/networking candidates were ruled out across two investigation
+rounds (`@log_activity`, the classifier's taxonomy scan, CPU/memory
+saturation, uvicorn tuning, connection-pool sizing, 3x replica capacity),
+then a minimal zero-app-code control test (bare FastAPI, one instant
+route, one `asyncio.sleep` route) reproduced the identical pattern and
+resolved it directly: it's the one-time cost of establishing ~20
+concurrent brand-new TCP connections from an empty pool — proven by the
+IDs of every delayed request being exactly the first ~20 submitted, and
+by the effect disappearing entirely on a second round against the same,
+now-warm client. Every loadtest run in this investigation used a fresh
+client against a freshly-restarted container, so **most of what was
+measured as "degradation" across both rounds was this same one-time cost,
+re-measured on every run** — not sustained contention, not Docker, not
+WSL2, not this codebase's request-handling. `scripts/loadtest.py` now
+warms its connection pool before timing; a real deployment should send
+one warm-up request through each code path (rules and LLM) at startup for
+the same reason. Full mechanism and every number, including a real-app
+wrinkle a cheap warm-up alone doesn't fully close:
+`docs/infrastructure/latency-investigation.md`. The 600ms
 model-path target fails outright —
 measured p95 well into multi-second territory against the real API, root
 caused (not just observed): Structured Outputs strict mode forces every

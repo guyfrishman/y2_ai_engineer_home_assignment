@@ -137,35 +137,44 @@ docker compose up --build
   Under concurrent load (a loadtest run with ~27 real fallback calls in
   flight) model-path p95 climbed further — consistent with
   queuing/throttling under burst concurrent traffic from one API key — and
-  the cache/rules path's own p95 also degraded in the same runs (200-700ms
-  across several, despite doing no network I/O). Seven candidate causes
-  have now been tested directly, not assumed, across two investigation
-  rounds, and all seven are ruled out: `@log_activity`, the classifier's
-  taxonomy-term scan, raw CPU/memory saturation, uvicorn's
-  backlog/keep-alive tuning, the AsyncOpenAI client's connection-pool size,
-  and — the biggest lever tried — running 3x the capacity behind a real
-  load balancer. None moved cache/rules p95 outside its existing
-  run-to-run noise band. What *is* confirmed causally (a direct A/B test:
-  0/144 vs. 26/129 requests over 100ms at the same concurrency) is that the
-  stall only appears when concurrent LLM-path traffic is present, and a
-  bimodal latency distribution (most requests fast, a tight cluster stuck
-  at a near-identical delay) points at a shared blocking resource, not a
-  per-request cost. Full methodology and every number:
-  `docs/infrastructure/latency-investigation.md`'s "Docker/infra
-  investigation" section. Leading remaining hypothesis, not yet isolated:
-  infrastructure shared across every instance alike — most concretely, the
-  Docker Desktop WSL2 network translation layer between this project's test
-  client and the containers in this development environment.
+  the cache/rules path's own p95 also appeared to degrade in the same runs
+  (200-700ms across several, despite doing no network I/O). Seven
+  candidate causes were tested directly across two investigation rounds
+  and all seven ruled out (`@log_activity`, the classifier's taxonomy-term
+  scan, raw CPU/memory saturation, uvicorn tuning, connection-pool sizing,
+  3x replica capacity) before a minimal zero-app-code control test
+  (a bare FastAPI app, one instant route, one `asyncio.sleep` route)
+  reproduced the identical pattern and resolved it: it's the one-time cost
+  of establishing ~20 concurrent brand-new TCP connections from an empty
+  connection pool, paid once by the first wave of concurrent requests —
+  confirmed by IDs of every delayed request being exactly the first ~20
+  submitted, and by the effect vanishing on a second round against the
+  same already-warm client. Since every loadtest run in this investigation
+  used a fresh client against a freshly-restarted container, **most of the
+  "degradation" measured across both rounds was this cost, re-measured
+  repeatedly**, not a sustained property of the running service. Full
+  mechanism and every number: `docs/infrastructure/latency-investigation.md`'s
+  "Resolved" section — including a real-app-specific wrinkle where a cheap
+  warm-up alone doesn't fully close the gap, pointing at a second,
+  smaller one-time cost tied to the first genuine OpenAI call.
 
-  The credible paths to closing the core gap, not yet implemented: (1)
-  scope the `יד_שנייה` schema to just the rule path's candidate
-  subcategory instead of unioning all subcategories' fields — untested
-  whether this helps meaningfully, since latency looked roughly flat
-  across this project's 20–28-field range; (2) drop strict-mode Structured
-  Outputs in favor of a looser prompt + post-hoc Pydantic validation
-  (trades schema-enforced generation for speed — validation still catches
-  a bad shape, just without generation-time constraint); (3) a
-  faster/smaller model, if one is found to support both Structured Outputs
-  and `logprobs` reliably at lower latency. See the root README's
-  Non-Functional Requirements table for the measured numbers this claim is
-  based on.
+  Schema scoping — asking the model only for fields the rule path didn't
+  already fill, instead of unioning every field for the vertical — was
+  implemented and measured: -8% completion tokens, -12% latency, and a
+  *higher* validation pass rate on the golden query set. Adopted into
+  `llm_fallback_service.py`. Real, but nowhere near enough on its own: a
+  real streaming call decomposed the ~2.6-3.5s Tier 1 latency and found
+  time-to-first-token — not generation speed — is the dominant cost
+  (300-1,700ms depending on connection warmth, with a 300-500ms floor even
+  fully warm), a prefill/constrained-decoding-setup cost that doesn't
+  scale down with a handful of excluded fields. Dropping strict-mode
+  Structured Outputs was tested earlier and rejected on correctness
+  grounds (56% faster, but Hebrew-key validity collapsed from 100% to
+  12%). The architectural conclusion this supports, stated plainly in
+  [ADR 0001](../decisions/0001-hybrid-rule-first-llm-fallback-pipeline.md):
+  600ms is not reachable by further optimizing this synchronous call —
+  every lever that could plausibly move the number has been tried and
+  either adopted or rejected on correctness grounds. The credible next
+  step is write-behind (same ADR), which changes whether the request
+  waits for the call at all, not how fast the call itself runs. Full
+  methodology and every number: `docs/infrastructure/latency-investigation.md`.

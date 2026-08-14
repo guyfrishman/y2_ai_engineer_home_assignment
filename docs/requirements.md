@@ -21,7 +21,7 @@ requirement-by-requirement record, per the assignment brief
 
 | Requirement | Implementation | Verified by (real measurement) |
 |---|---|---|
-| Latency: cache/rules p95 ≤150ms | In-process cache + pure-function rule pipeline, no I/O | **PASS** at moderate concurrency (p95 55ms cache / 41ms rules); **degrades under heavy concurrent real-LLM traffic** (p95 200-700ms at 20 concurrent, ~27 of them real API calls) — see the latency section below |
+| Latency: cache/rules p95 ≤150ms | In-process cache + pure-function rule pipeline, no I/O | **PASS** at moderate concurrency (p95 55ms cache / 41ms rules); a fresh, cold client/container's *first* burst of concurrent traffic can show 200-700ms — root-caused as a one-time connection-establishment cost, not sustained degradation — see the latency section below |
 | Latency: model path p95 ≤600ms | Two-tier OpenAI cascade, `y2_ai_search_api/services/llm_fallback_service.py` | **FAIL** — see [the full diagnosis below](#the-llm-path-latency-miss-full-diagnosis): ~2.6s avg for an isolated, uncontended Tier 1 call alone, ~4x over budget before any concurrency is involved |
 | Throughput ≥12 QPS/instance | Async end-to-end on the one real-I/O branch (`AsyncOpenAI`); sync CPU-bound rule path stays un-threaded (GIL — threading it measurably *increased* p95, see `services/search-api.md`'s Quirks) | **PASS** — 15-30 QPS measured with real LLM traffic in the mix (varies run-to-run against the live API), 533+ QPS on a rules/cache-heavy mix |
 | Caching (query, normalization) | Full-response cache (`y2_ai_search_api/repositories/cache_repository.py`, `cachetools.TTLCache`, taxonomy-version-keyed) **and** a separate word-level `functools.lru_cache` on typo correction (`normalizer_service.py`) | `y2_ai_search_api/tests/test_cache_repository.py`; `test_correct_word_is_memoized` |
@@ -131,32 +131,56 @@ behind a real nginx load balancer (no reproducible improvement, and a
 confirmed real cost: cache-hit rate drops since each replica keeps its
 own independent cache).
 
-**What is confirmed, not just ruled out:** a direct A/B test at fixed
-concurrency (LLM-path traffic present vs. completely absent) shows the
-stall only appears with concurrent LLM traffic — 0/144 vs. 26/129 cache
-requests over 100ms — and the slow requests cluster tightly around one
-latency value rather than spreading out, the signature of a shared
-blocking resource releasing a batch of waiters together, not a
-per-request cost. None of the seven tested candidates are that resource.
-The leading remaining hypothesis, not yet isolated: infrastructure shared
-across every instance alike (all of them, including the 3-replica setup,
-still sit behind the same Docker Desktop WSL2 network translation layer
-between this project's test client and its containers) — confirming that
-specific layer needs a different test environment (bare-Linux Docker, or
-a loadtest client co-located inside the Docker network) than was
-available for this investigation.
+**Resolved in a follow-up round, not left as an open infra guess.** A
+minimal FastAPI app with zero lines of this project's code (two routes,
+one instant, one `asyncio.sleep`) reproduced the identical bimodal
+pattern, ruling out every candidate above at once. Correlating client and
+server wall-clock timestamps pinned the ~280ms gap to the time *before*
+the server's handler starts running, not inside it (server-side handling
+measured 0.000ms for every "stuck" request); the IDs of every delayed
+request were exactly the first ~20 submitted, never a later one — the
+signature of a one-time cost paid once by the first wave of concurrent
+requests, not sustained contention. Confirmed directly: running the same
+traffic twice against the same client (no restart) showed clustering
+only on the first round; a completely clean second round followed
+immediately after, same server, same traffic. It is the cost of
+establishing ~20 concurrent brand-new TCP connections at once from an
+empty connection pool — and since `scripts/loadtest.py` created a fresh
+client on every invocation (and every test in this investigation also
+used a freshly-restarted container), **every "degraded" p95 measured in
+both investigation rounds was substantially re-measuring this one-time
+cost**, not a sustained property of the running service. Full mechanism,
+every number, and the residual real-app-specific wrinkle (a lightweight
+warm-up alone doesn't fully close the gap — see that section for why):
+`infrastructure/latency-investigation.md`'s "Resolved" section.
 
-**The credible paths to closing the core gap, honestly not yet
-implemented:** scoping the `יד_שנייה` schema to the rule path's candidate
-subcategory instead of unioning all subcategories' fields (untested
-whether it would help, given latency looked flat across this project's
-20–28-field range); dropping strict-mode Structured Outputs for a looser
-prompt with post-hoc Pydantic validation (rejected once already above —
-would need a stronger model than nano to keep Hebrew-key reliability, at
-higher per-token cost); or a **write-behind architecture** that removes
-the LLM call from the request's own critical path entirely — documented as
-the recommended next step, with its own trade-off made explicit, in
+**Schema scoping — implemented and adopted, not left untested.** A
+related but more general idea than the originally-speculated "scope the
+`יד_שנייה` schema to the rule path's candidate subcategory": scope the
+wire schema on *every* fallback call to just the fields the rule path
+didn't already fill, regardless of vertical. Measured against the golden
+query set (8 queries spanning all 3 verticals, real Tier 1 calls): **-8%
+completion tokens, -12% latency, and a higher validation pass rate**
+(fewer fields for the model to get wrong), with the merged result still
+validated against the full, unscoped taxonomy model — proven with a
+regression test using the one check that only fires on the full merged
+object (`UsedGoodsParams`' sector/subcategory cross-field validator).
+Adopted into `llm_fallback_service.py`. Full methodology and numbers:
+`infrastructure/latency-investigation.md`'s schema-scoping section.
+
+**What's still not implemented, and why:** dropping strict-mode
+Structured Outputs for a looser prompt with post-hoc Pydantic validation
+(rejected already — would need a stronger model than nano to keep
+Hebrew-key reliability, at higher per-token cost); or a **write-behind
+architecture** that removes the LLM call from the request's own critical
+path entirely — documented as the recommended next step, with its own
+trade-off made explicit, in
 [`decisions/0001-hybrid-rule-first-llm-fallback-pipeline.md`](decisions/0001-hybrid-rule-first-llm-fallback-pipeline.md#future-direction-write-behind--optimistic-degrade-not-implemented).
+Schema scoping meaningfully reduces cost and shaves real latency off the
+call, but doesn't get anywhere close to closing the 600ms gap on its own
+— the dominant cost (prefill + constrained-decoding setup before the
+first output token, see the TTFT section below) isn't schema-size-driven
+in a way scoping down by a handful of fields fixes.
 
 This is disclosed here, and in the root README, deliberately — not in fine
 print. A README that only shows the numbers that pass isn't a credible one.
