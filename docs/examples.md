@@ -5,8 +5,8 @@ JSON the service returns. Five resolve via the rule path alone (no model
 call); three fall below `confidence_threshold` (0.58) and route to the LLM
 fallback tier — for those, the `params` shown is what the **rule path alone**
 extracts (verified, deterministic), with a note on what the LLM tier adds.
-All rule-path outputs here are asserted by `api/tests/test_extractor_service.py`
-and `api/tests/test_security_redteam.py` — nothing below is aspirational.
+All rule-path outputs here are asserted by `y2_ai_search_api/tests/test_extractor_service.py`
+and `y2_ai_search_api/tests/test_security_redteam.py` — nothing below is aspirational.
 
 ## נדל״ן (Real Estate)
 
@@ -213,7 +213,7 @@ than risk another mismatch — real model output varies call to call.
 ## Reproducing these
 
 ```bash
-cd api
+cd y2_ai_search_api
 uv run pytest tests/test_extractor_service.py -v
 ```
 

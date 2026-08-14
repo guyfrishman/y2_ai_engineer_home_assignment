@@ -16,7 +16,7 @@ productive in under an hour.
 ## Get it running (5 minutes)
 
 ```bash
-cd api
+cd y2_ai_search_api
 cp .env.example .env
 uv sync
 uv run uvicorn main:app --reload      # http://localhost:8000/docs
@@ -55,7 +55,7 @@ sanitize -> normalize -> cache lookup --hit--> return (<=150ms)
 ```
 
 - The taxonomy (`spec/yad2_search_taxonomy.json`, vendored into
-  `api/app/data/taxonomy.json`) is the **single source of truth** for which
+  `y2_ai_search_api/data/taxonomy.json`) is the **single source of truth** for which
   fields exist. `taxonomy_models.py` builds Pydantic models from it at
   import time — there is no hand-maintained field list to fall out of sync.
 - The rule path and the LLM fallback path validate against the **exact same**
@@ -68,7 +68,7 @@ sanitize -> normalize -> cache lookup --hit--> return (<=150ms)
 ## The layout
 
 ```
-api/app/
+y2_ai_search_api/
 ├── config.py            # typed settings (env-driven)
 ├── logger.py             # log_event + trace_id ContextVar (set by middleware)
 ├── security.py           # X-API-Key dependency

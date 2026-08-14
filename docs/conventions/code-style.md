@@ -20,7 +20,7 @@
 5. **One concept per file.** `openai_repository.py` only talks to OpenAI;
    `cache_repository.py` only caches. Don't mix concerns.
 6. **Pydantic v2 for data that crosses a boundary** (HTTP, function calls
-   between layers). Request/response/taxonomy models live in `app/schema/`.
+   between layers). Request/response/taxonomy models live in `y2_ai_search_api/schema/`.
 7. **Thin layers.** Routers delegate to services; services orchestrate;
    repositories own I/O. See [routers.md](routers.md) and [repositories.md](repositories.md).
 8. **No clever metaprogramming beyond what the taxonomy genuinely needs.**

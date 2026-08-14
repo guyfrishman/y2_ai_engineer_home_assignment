@@ -3,13 +3,13 @@
 Tests should run anywhere, instantly, with no network and no API key.
 
 ```bash
-cd api
+cd y2_ai_search_api
 uv run pytest
 ```
 
 99 tests, `~2s`, zero network calls.
 
-## What's covered (`api/tests/`)
+## What's covered (`y2_ai_search_api/tests/`)
 
 | Test file | Asserts |
 |---|---|

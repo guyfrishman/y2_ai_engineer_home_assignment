@@ -4,7 +4,7 @@ All configuration is environment-driven through a single typed settings
 object, with one deliberate exception (below) — not scattered `os.getenv`
 calls across the codebase.
 
-## `app/config.py`
+## `y2_ai_search_api/config.py`
 
 ```python
 class Settings(BaseSettings):
@@ -54,7 +54,7 @@ and `settings` is a module-level singleton built once at import, so reading
 `settings.api_access_key` here would freeze whatever value was present at
 process start. `verify_api_key` calls this function per-request specifically
 so auth can be enabled/disabled live. See the function's docstring in
-`app/config.py` for the full rationale.
+`y2_ai_search_api/config.py` for the full rationale.
 
 ## Secrets
 

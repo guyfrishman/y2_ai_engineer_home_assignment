@@ -14,7 +14,7 @@ swappable.
 
 ### `TaxonomyRepository` — the allowlist, loaded once
 
-`app/repositories/taxonomy_repository.py` reads `data/taxonomy.json` at
+`y2_ai_search_api/repositories/taxonomy_repository.py` reads `data/taxonomy.json` at
 import time and builds:
 - per-vertical Pydantic params models (`taxonomy_models.py`'s
   `build_*_params_model` functions), each `extra="forbid"`;
@@ -84,7 +84,7 @@ service or router changes.
 
 ### `OpenAIRepository` — OpenAI-specific, not provider-agnostic
 
-`app/repositories/openai_repository.py` wraps `openai.AsyncOpenAI`. Unlike
+`y2_ai_search_api/repositories/openai_repository.py` wraps `openai.AsyncOpenAI`. Unlike
 a typical template's provider-agnostic `LlmRepository`, this class is named
 and shaped for OpenAI specifically — see
 [`../decisions/0002-openai-specific-repository.md`](../decisions/0002-openai-specific-repository.md)

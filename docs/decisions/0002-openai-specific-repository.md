@@ -1,6 +1,6 @@
 # 0002 - OpenAI-specific repository, not a provider-agnostic abstraction
 
-**Decision:** `app/repositories/openai_repository.py` defines
+**Decision:** `y2_ai_search_api/repositories/openai_repository.py` defines
 `OpenAIRepository`, a concrete class built on `openai.AsyncOpenAI` — not an
 `LlmRepository` interface with a swappable, base-URL-configurable
 implementation. This is a deliberate deviation from

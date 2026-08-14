@@ -13,7 +13,7 @@ greppable separately from ordinary parsing-decision logs.
 
 1. HTTP-level basics (request count/status/latency per route) from
    `prometheus-fastapi-instrumentator`, wired in `main.py`.
-2. Custom pipeline metrics, `app/metrics.py`:
+2. Custom pipeline metrics, `y2_ai_search_api/metrics.py`:
 
 | Metric | Type | Labels | What it answers |
 |---|---|---|---|
@@ -56,7 +56,7 @@ real loadtest run instead of a synthetic dashboard export.
   The `Dockerfile` also declares a `HEALTHCHECK` hitting this same
   endpoint (stdlib `urllib` — the slim runtime image has no `curl`/`wget`,
   and `/health` needs no credentials since it's unauthenticated by design;
-  see `app/security.py`), so `docker ps`/orchestrators can see container
+  see `y2_ai_search_api/security.py`), so `docker ps`/orchestrators can see container
   health without a sidecar probe.
 - SLO targets are the brief's own: p95 ≤150ms cache/rules path, p95 ≤600ms
   model path, ≥12 QPS per instance. `scripts/loadtest.py` measures and

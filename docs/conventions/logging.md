@@ -2,7 +2,7 @@
 
 ## One function: `log_event`
 
-`app/logger.py` exposes a single entry point:
+`y2_ai_search_api/logger.py` exposes a single entry point:
 
 ```python
 from app.logger import log_event

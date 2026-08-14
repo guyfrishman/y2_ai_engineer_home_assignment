@@ -8,30 +8,30 @@ requirement-by-requirement record, per the assignment brief
 
 | Requirement | Implementation | Verified by |
 |---|---|---|
-| `POST /parse`: Hebrew text → `{category, params, confidence, notes}` | `api/app/routers/search.py`, `api/app/services/parse_service.py` | `api/tests/test_parse_api.py`; live `curl` — see root README Quickstart |
-| Detect vertical (נדל״ן / רכב / יד_שנייה) | `api/app/services/classifier_service.py` — taxonomy-term coverage scoring | `api/tests/test_classifier_service.py` |
-| Extract + normalize fields per taxonomy only | `api/app/services/extractor_service.py` + `api/app/schema/taxonomy_models.py` (dynamically built, `extra="forbid"`, `Literal`-typed enums, cross-field sector/subcategory check) | `api/tests/test_extractor_service.py`, `api/tests/test_security_redteam.py` |
+| `POST /parse`: Hebrew text → `{category, params, confidence, notes}` | `y2_ai_search_api/routers/search.py`, `y2_ai_search_api/services/parse_service.py` | `y2_ai_search_api/tests/test_parse_api.py`; live `curl` — see root README Quickstart |
+| Detect vertical (נדל״ן / רכב / יד_שנייה) | `y2_ai_search_api/services/classifier_service.py` — taxonomy-term coverage scoring | `y2_ai_search_api/tests/test_classifier_service.py` |
+| Extract + normalize fields per taxonomy only | `y2_ai_search_api/services/extractor_service.py` + `y2_ai_search_api/schema/taxonomy_models.py` (dynamically built, `extra="forbid"`, `Literal`-typed enums, cross-field sector/subcategory check) | `y2_ai_search_api/tests/test_extractor_service.py`, `y2_ai_search_api/tests/test_security_redteam.py` |
 | Reject/flag unknown fields, never invent keys | Same taxonomy models — structurally impossible to emit an unlisted field | `test_pydantic_model_rejects_a_directly_injected_unknown_field`, `test_extracted_params_never_include_a_field_outside_the_taxonomy` |
-| `GET /health` | `api/app/routers/ping.py` — also reports `taxonomy_version` | `test_health_is_open_and_reports_taxonomy_version` |
-| `GET /metrics` | `api/app/metrics.py` + `prometheus-fastapi-instrumentator`, wired in `api/main.py` | `test_metrics_endpoint_is_open_and_exposes_custom_counters`; live `curl` |
-| Typo/slang tolerance | `api/app/services/normalizer_service.py` — static typo map + `rapidfuzz` fuzzy fallback + preposition-prefix stripping | `api/tests/test_normalizer_service.py`; slang cases in `test_security_redteam.py` |
-| 5-10 worked examples with expected JSON | [`examples.md`](examples.md) — 8 examples, all asserted in `api/tests/test_extractor_service.py` | Re-run: `uv run pytest tests/test_extractor_service.py -v` |
+| `GET /health` | `y2_ai_search_api/routers/ping.py` — also reports `taxonomy_version` | `test_health_is_open_and_reports_taxonomy_version` |
+| `GET /metrics` | `y2_ai_search_api/metrics.py` + `prometheus-fastapi-instrumentator`, wired in `y2_ai_search_api/main.py` | `test_metrics_endpoint_is_open_and_exposes_custom_counters`; live `curl` |
+| Typo/slang tolerance | `y2_ai_search_api/services/normalizer_service.py` — static typo map + `rapidfuzz` fuzzy fallback + preposition-prefix stripping | `y2_ai_search_api/tests/test_normalizer_service.py`; slang cases in `test_security_redteam.py` |
+| 5-10 worked examples with expected JSON | [`examples.md`](examples.md) — 8 examples, all asserted in `y2_ai_search_api/tests/test_extractor_service.py` | Re-run: `uv run pytest tests/test_extractor_service.py -v` |
 
 ## Non-Functional Requirements
 
 | Requirement | Implementation | Verified by (real measurement) |
 |---|---|---|
 | Latency: cache/rules p95 ≤150ms | In-process cache + pure-function rule pipeline, no I/O | **PASS** at moderate concurrency (p95 55ms cache / 41ms rules); **degrades under heavy concurrent real-LLM traffic** (p95 200-700ms at 20 concurrent, ~27 of them real API calls) — see the latency section below |
-| Latency: model path p95 ≤600ms | Two-tier OpenAI cascade, `api/app/services/llm_fallback_service.py` | **FAIL** — see [the full diagnosis below](#the-llm-path-latency-miss-full-diagnosis): ~2.6s avg for an isolated, uncontended Tier 1 call alone, ~4x over budget before any concurrency is involved |
+| Latency: model path p95 ≤600ms | Two-tier OpenAI cascade, `y2_ai_search_api/services/llm_fallback_service.py` | **FAIL** — see [the full diagnosis below](#the-llm-path-latency-miss-full-diagnosis): ~2.6s avg for an isolated, uncontended Tier 1 call alone, ~4x over budget before any concurrency is involved |
 | Throughput ≥12 QPS/instance | Async end-to-end on the one real-I/O branch (`AsyncOpenAI`); sync CPU-bound rule path stays un-threaded (GIL — threading it measurably *increased* p95, see `services/search-api.md`'s Quirks) | **PASS** — 15-30 QPS measured with real LLM traffic in the mix (varies run-to-run against the live API), 533+ QPS on a rules/cache-heavy mix |
-| Caching (query, normalization) | Full-response cache (`api/app/repositories/cache_repository.py`, `cachetools.TTLCache`, taxonomy-version-keyed) **and** a separate word-level `functools.lru_cache` on typo correction (`normalizer_service.py`) | `api/tests/test_cache_repository.py`; `test_correct_word_is_memoized` |
-| Cost tracking, $/request, 10M/mo estimate | `api/app/metrics.py` (`parse_tokens_total`, `parse_cost_usd_total`) computed from a verified pricing table | [`infrastructure/cost-model.md`](infrastructure/cost-model.md) — real measured tokens |
-| Observability: requests/category, error rate, p50/p95, cache hit ratio, tokens, cost, model success/failure | `api/app/metrics.py` — 7 custom Prometheus metrics + HTTP-level instrumentation | [`infrastructure/observability.md`](infrastructure/observability.md); live `GET /metrics` |
-| Structured logs: parsing decisions & security events | `api/app/logger.py`'s `log_event`, `trace_id` set once per request by middleware — security events use a distinct `security_`-prefixed `event=` tag, greppable separately | [`conventions/logging.md`](conventions/logging.md) |
-| Fixed system prompts, allowlisted fields | `api/app/prompts/system_prompts.py` — never interpolates user input beyond the vertical name | [`conventions/llm-usage.md`](conventions/llm-usage.md) |
-| Strict JSON Schema validation | Taxonomy Pydantic models, `extra="forbid"`, `Literal` enums, cross-field validator; same models used for both the rule path and as the LLM's Structured Outputs schema | `api/tests/test_llm_fallback_service.py::test_strict_json_schema_has_no_optional_fields_and_forbids_extras` |
-| Input sanitization (emoji/control chars/length) | `api/app/services/sanitizer_service.py` | `api/tests/test_sanitizer_service.py` |
-| Red-team tests (injection, unicode, oversized, slang) | `api/tests/test_security_redteam.py` — 23 tests | `uv run pytest tests/test_security_redteam.py -v` — all pass |
+| Caching (query, normalization) | Full-response cache (`y2_ai_search_api/repositories/cache_repository.py`, `cachetools.TTLCache`, taxonomy-version-keyed) **and** a separate word-level `functools.lru_cache` on typo correction (`normalizer_service.py`) | `y2_ai_search_api/tests/test_cache_repository.py`; `test_correct_word_is_memoized` |
+| Cost tracking, $/request, 10M/mo estimate | `y2_ai_search_api/metrics.py` (`parse_tokens_total`, `parse_cost_usd_total`) computed from a verified pricing table | [`infrastructure/cost-model.md`](infrastructure/cost-model.md) — real measured tokens |
+| Observability: requests/category, error rate, p50/p95, cache hit ratio, tokens, cost, model success/failure | `y2_ai_search_api/metrics.py` — 7 custom Prometheus metrics + HTTP-level instrumentation | [`infrastructure/observability.md`](infrastructure/observability.md); live `GET /metrics` |
+| Structured logs: parsing decisions & security events | `y2_ai_search_api/logger.py`'s `log_event`, `trace_id` set once per request by middleware — security events use a distinct `security_`-prefixed `event=` tag, greppable separately | [`conventions/logging.md`](conventions/logging.md) |
+| Fixed system prompts, allowlisted fields | `y2_ai_search_api/prompts/system_prompts.py` — never interpolates user input beyond the vertical name | [`conventions/llm-usage.md`](conventions/llm-usage.md) |
+| Strict JSON Schema validation | Taxonomy Pydantic models, `extra="forbid"`, `Literal` enums, cross-field validator; same models used for both the rule path and as the LLM's Structured Outputs schema | `y2_ai_search_api/tests/test_llm_fallback_service.py::test_strict_json_schema_has_no_optional_fields_and_forbids_extras` |
+| Input sanitization (emoji/control chars/length) | `y2_ai_search_api/services/sanitizer_service.py` | `y2_ai_search_api/tests/test_sanitizer_service.py` |
+| Red-team tests (injection, unicode, oversized, slang) | `y2_ai_search_api/tests/test_security_redteam.py` — 23 tests | `uv run pytest tests/test_security_redteam.py -v` — all pass |
 
 ## The LLM-path latency miss: full diagnosis
 

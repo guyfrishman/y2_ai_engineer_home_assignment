@@ -1,6 +1,6 @@
 # search-api — Hebrew free-text search-understanding service
 
-**Path:** `api/` · **Package/Port:** `yad2-search-api` · `8000` · **Status:** ✅ implemented
+**Path:** `y2_ai_search_api/` · **Package/Port:** `yad2-search-api` · `8000` · **Status:** ✅ implemented
 
 ## What it does
 
@@ -21,33 +21,32 @@ repo — there's no separate UI or worker.
 ## Layout
 
 ```
-api/
+y2_ai_search_api/
 ├── main.py                  # mounts routers, wires Instrumentator
-├── app/
-│   ├── config.py             # Settings
-│   ├── logger.py              # log_event, trace_id ContextVar
-│   ├── security.py             # X-API-Key dependency
-│   ├── metrics.py               # custom Prometheus counters/histograms
-│   ├── data/taxonomy.json        # vendored copy of spec/yad2_search_taxonomy.json
-│   ├── prompts/system_prompts.py  # fixed Tier 1/Tier 2 extraction prompts
-│   ├── repositories/
-│   │   ├── taxonomy_repository.py  # loads + indexes taxonomy once
-│   │   ├── cache_repository.py      # CacheRepository(ABC) + InMemoryTTLCache
-│   │   └── openai_repository.py      # AsyncOpenAI-backed client
-│   ├── schema/
-│   │   ├── taxonomy_models.py    # dynamically-built per-vertical Pydantic models
-│   │   ├── requests.py            # ParseRequest
-│   │   └── responses.py            # ParseResponse, HealthResponse
-│   ├── services/
-│   │   ├── sanitizer_service.py     # strip control chars/emoji, cap length
-│   │   ├── normalizer_service.py     # units, ranges, typo correction
-│   │   ├── classifier_service.py      # rule-based vertical detection + confidence
-│   │   ├── extractor_service.py        # dict-driven, per-vertical field extraction
-│   │   ├── llm_confidence_service.py    # logprob + embedding blended confidence
-│   │   ├── llm_fallback_service.py       # two-tier LLM cascade
-│   │   └── parse_service.py               # orchestrates the full pipeline
-│   └── routers/
-│       ├── api.py, search.py, ping.py
+├── config.py                 # Settings
+├── logger.py                  # log_event, trace_id ContextVar
+├── security.py                 # X-API-Key dependency
+├── metrics.py                   # custom Prometheus counters/histograms
+├── data/taxonomy.json            # vendored copy of spec/yad2_search_taxonomy.json
+├── prompts/system_prompts.py      # fixed Tier 1/Tier 2 extraction prompts
+├── repositories/
+│   ├── taxonomy_repository.py  # loads + indexes taxonomy once
+│   ├── cache_repository.py      # CacheRepository(ABC) + InMemoryTTLCache
+│   └── openai_repository.py      # AsyncOpenAI-backed client
+├── schema/
+│   ├── taxonomy_models.py    # dynamically-built per-vertical Pydantic models
+│   ├── requests.py            # ParseRequest
+│   └── responses.py            # ParseResponse, HealthResponse
+├── services/
+│   ├── sanitizer_service.py     # strip control chars/emoji, cap length
+│   ├── normalizer_service.py     # units, ranges, typo correction
+│   ├── classifier_service.py      # rule-based vertical detection + confidence
+│   ├── extractor_service.py        # dict-driven, per-vertical field extraction
+│   ├── llm_confidence_service.py    # logprob + embedding blended confidence
+│   ├── llm_fallback_service.py       # two-tier LLM cascade
+│   └── parse_service.py               # orchestrates the full pipeline
+├── routers/
+│   └── api.py, search.py, ping.py
 └── tests/                     # 99 tests, no network — see docs/conventions/testing.md
 ```
 
@@ -58,7 +57,7 @@ Follows the repo conventions — [routers](../conventions/routers.md),
 ## Run
 
 ```bash
-cd api
+cd y2_ai_search_api
 cp .env.example .env
 uv sync
 uv run uvicorn main:app --reload
@@ -99,9 +98,9 @@ docker compose up --build
   *increased* p95 latency versus this split approach — see
   `scripts/loadtest.py`'s output history in the root README.
 - **The taxonomy file is vendored, not read from `spec/` at runtime.**
-  `api/app/data/taxonomy.json` is a copy of `spec/yad2_search_taxonomy.json`,
+  `y2_ai_search_api/data/taxonomy.json` is a copy of `spec/yad2_search_taxonomy.json`,
   kept in sync manually. This keeps the Docker build self-contained
-  (`api/` doesn't need the repo root in its build context) at the cost of a
+  (`y2_ai_search_api/` doesn't need the repo root in its build context) at the cost of a
   file that must be re-copied if the source taxonomy changes — acceptable
   for this service's scope; a larger service would resolve this with a
   build step or a shared package.

@@ -16,7 +16,7 @@ examples) resolve on rules alone, at zero model cost.
 
 ## The client
 
-`app/repositories/openai_repository.py`:
+`y2_ai_search_api/repositories/openai_repository.py`:
 
 ```python
 class OpenAIRepository:
@@ -33,7 +33,7 @@ router.
 
 ## The two-tier cascade
 
-`app/services/llm_fallback_service.py`:
+`y2_ai_search_api/services/llm_fallback_service.py`:
 
 1. **Tier 1** (`settings.openai_fallback_model`, default `gpt-4.1-nano`) —
    cheapest suitable model, one attempt, Structured Outputs (`response_format:
@@ -60,7 +60,7 @@ paying for a failure mode the schema already neutralizes for free.
   derives it from the same Pydantic model the rule path uses, so the two
   paths can never drift into allowing different fields.
 - **Fixed system prompts, never templated with user input beyond the
-  vertical name.** `app/prompts/system_prompts.py`'s
+  vertical name.** `y2_ai_search_api/prompts/system_prompts.py`'s
   `build_extraction_system_prompt(vertical)` only interpolates the vertical
   string, which comes from the classifier, never from the request. See
   that file's docstring for why this, combined with Structured Outputs,
@@ -78,5 +78,5 @@ paying for a failure mode the schema already neutralizes for free.
 
 ## Prompts
 
-System prompts live in `app/prompts/`. Kept in code (versioned, reviewable),
+System prompts live in `y2_ai_search_api/prompts/`. Kept in code (versioned, reviewable),
 not a database.

@@ -636,4 +636,4 @@ confirmed the hang, then confirmed the fix (catching `BaseException`,
 wrapping a bare `CancelledError` as a plain `RuntimeError` so it doesn't
 bleed an unrelated cancellation into the waiter's own task) resolves it in
 microseconds instead. See `docs/conventions/repositories.md`'s coalescing
-section and `app/services/parse_service.py` for the fixed code.
+section and `y2_ai_search_api/services/parse_service.py` for the fixed code.

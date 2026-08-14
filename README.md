@@ -62,7 +62,7 @@ rationale: [`docs/decisions/0001-hybrid-rule-first-llm-fallback-pipeline.md`](do
 ## Quickstart
 
 ```bash
-cd api
+cd y2_ai_search_api
 cp .env.example .env
 # Edit .env: set OPENAI_API_KEY for the LLM-fallback tier (optional — the
 # service runs and degrades gracefully without one).
@@ -83,8 +83,8 @@ curl http://localhost:8000/metrics
 ```
 
 ```bash
-cd api && uv run pytest                                              # 99 tests, no network, ~1.5s
-cd api && uv run python ../scripts/loadtest.py --requests 200 --concurrency 20
+cd y2_ai_search_api && uv run pytest                                              # 99 tests, no network, ~1.5s
+cd y2_ai_search_api && uv run python ../scripts/loadtest.py --requests 200 --concurrency 20
 ```
 
 ## The honest finding: the model-path latency target isn't met
