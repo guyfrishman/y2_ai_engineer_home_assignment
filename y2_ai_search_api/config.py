@@ -31,6 +31,11 @@ class Settings(BaseSettings):
     openai_fallback_model: str = "gpt-4.1-nano"
     openai_escalation_model: str = "gpt-4.1-mini"
     openai_embedding_model: str = "text-embedding-3-small"
+    # Explicit, short timeout/no retries: this service already has its own
+    # retry-equivalent (Tier 1 -> Tier 2 -> degrade), so SDK-level retrying
+    # underneath that just hides failures instead of surfacing them.
+    openai_request_timeout_seconds: float = 5.0
+    openai_max_retries: int = 0
 
     # Rule-path confidence at or above this value skips the LLM fallback
     # entirely. Tuned against the golden example set in docs/examples.md —

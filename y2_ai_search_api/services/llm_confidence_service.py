@@ -27,6 +27,16 @@ from schema.taxonomy_models import Vertical
 LOGPROB_WEIGHT = 0.7
 EMBEDDING_WEIGHT = 0.3
 
+# A weighted-additive blend can't veto: at LOGPROB_WEIGHT=0.7, confidence
+# is >= threshold(0.58) whenever logprob_confidence >= ~0.83, regardless of
+# embedding_similarity. Hard floor instead: below this similarity, cap
+# confidence outright -- semantic mismatch overrides how sure the model
+# was about its own tokens. 0.5 sits above measured mismatch cases
+# (injection: 0.0, gaming-monitor: ~0.42-0.43) and below typical legitimate
+# matches.
+EMBEDDING_SIMILARITY_FLOOR = 0.5
+CONFIDENCE_CEILING_ON_MISMATCH = 0.4
+
 
 def _reconstruct_text_and_token_spans(token_logprobs: list) -> tuple[str, list[tuple[int, int, float]]]:
     """Concatenate completion tokens back into the full text, recording each
@@ -180,6 +190,11 @@ async def compute_llm_confidence(
 
     confidence = LOGPROB_WEIGHT * logprob_confidence + EMBEDDING_WEIGHT * embedding_similarity
     confidence = min(max(confidence, 0.0), 1.0)
+
+    vetoed = embedding_similarity < EMBEDDING_SIMILARITY_FLOOR
+    if vetoed:
+        confidence = min(confidence, CONFIDENCE_CEILING_ON_MISMATCH)
+
     # The headline number a caller sees is the blend; without this, there is
     # no way from the logs to tell whether a low (or a deceptively high)
     # confidence came from the model's own token-level uncertainty, a
@@ -190,6 +205,7 @@ async def compute_llm_confidence(
         logprob_confidence=round(logprob_confidence, 4),
         embedding_similarity=round(embedding_similarity, 4),
         embedding_outcome=embedding_outcome,
+        vetoed=vetoed,
         confidence=round(confidence, 4),
     )
     return confidence

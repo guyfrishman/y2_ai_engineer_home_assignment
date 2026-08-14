@@ -1,10 +1,13 @@
 """Two-tier LLM fallback, only invoked when the rule path's confidence is
 below settings.confidence_threshold.
 
-  Tier 1 (cheap, settings.openai_fallback_model) -> on required-field
-  validation failure or api_error -> Tier 2 (stronger,
-  settings.openai_escalation_model) -> on the same failure modes ->
-  degrade to the rule path's own result.
+  Tier 1 (cheap, settings.openai_fallback_model) -> on api_error -> Tier 2
+  (stronger, settings.openai_escalation_model) -> on api_error or
+  validation failure -> degrade to the rule path's own result.
+
+  A Tier 1 *validation* failure does not escalate: a schema-valid response
+  the model couldn't produce once is not more likely on a second, unrelated
+  attempt. Only api_error escalates.
 
 No Tier 3. See docs/DESIGN.md.
 """
@@ -39,6 +42,11 @@ CATEGORY_DEGRADED_NOTE = (
     "low-confidence extraction — the category itself was low-confidence (zero taxonomy signal), "
     "not just the extracted fields"
 )
+# The classify call succeeded and the model explicitly said "none of the
+# three" -- not a failure, so this must not share DEGRADED_CONFIDENCE/
+# CATEGORY_DEGRADED_NOTE (which mean "we tried and guessed").
+NOT_APPLICABLE_CONFIDENCE = 0.0
+NOT_APPLICABLE_NOTE = "query does not match any supported category (נדל״ן / רכב / יד_שנייה)"
 
 # A full-schema, mostly-null response tops out around 190-230 completion
 # tokens in measurement (see docs/DESIGN.md). This is a safety bound
@@ -132,17 +140,27 @@ def _scoped_strict_json_schema(model_class: type[BaseModel], already_known_field
     }
 
 
+@dataclass(frozen=True)
+class TierCallResult:
+    """failure_reason: None on success, "api_error", or "validation_failed"
+    (invalid JSON or schema violation) -- run_llm_fallback escalates to
+    Tier 2 on api_error, but not on validation_failed (a schema-valid
+    response the model couldn't produce once isn't likely to appear on a
+    second, unrelated attempt either)."""
+
+    params: BaseModel | None
+    token_logprobs: list | None
+    llm_returned_fields: dict | None
+    failure_reason: str | None = None
+
+
 async def _call_tier(
     vertical: Vertical, canonical_query: str, model_name: str, tier_label: str, rule_path_params: BaseModel
-) -> tuple[BaseModel, list, dict] | tuple[None, None, None]:
-    """Returns (validated_params, token_logprobs, llm_returned_fields) on
-    success, or (None, None, None) on api_error or required-field
-    validation failure — both logged as security_llm_validation_failed so
-    they're greppable separately from normal request logs.
-
-    llm_returned_fields is what the model itself generated, before merging
-    in the rule path's already-known fields — the confidence calc scores
-    the model's own answer, not fields it was never asked to produce."""
+) -> TierCallResult:
+    """llm_returned_fields is what the model itself generated, before
+    merging in the rule path's already-known fields — the confidence calc
+    scores the model's own answer, not fields it was never asked to
+    produce."""
     model_class = taxonomy_repository.params_models[vertical]
     already_known_fields = frozenset(rule_path_params.model_dump(exclude_none=True).keys())
     scoped_schema = _scoped_strict_json_schema(model_class, already_known_fields)
@@ -154,6 +172,7 @@ async def _call_tier(
         "type": "json_schema",
         "json_schema": {"name": "search_params", "schema": scoped_schema, "strict": True},
     }
+    log_event(level="DEBUG", event="llm_call_request", tier=tier_label, model=model_name, messages=messages)
 
     started_at = time.perf_counter()
 
@@ -181,9 +200,10 @@ async def _call_tier(
             duration_ms=elapsed_ms(),
         )
         PARSE_MODEL_CALLS_TOTAL.labels(tier=tier_label, outcome="api_error").inc()
-        return None, None, None
+        return TierCallResult(None, None, None, failure_reason="api_error")
 
     raw_content = response.choices[0].message.content or "{}"
+    log_event(level="DEBUG", event="llm_call_response", tier=tier_label, raw_content=raw_content)
     try:
         llm_returned_fields = json.loads(raw_content)
     except json.JSONDecodeError:
@@ -195,7 +215,7 @@ async def _call_tier(
             duration_ms=elapsed_ms(),
         )
         PARSE_MODEL_CALLS_TOTAL.labels(tier=tier_label, outcome="validation_failed").inc()
-        return None, None, None
+        return TierCallResult(None, None, None, failure_reason="validation_failed")
 
     # Validation always runs against the FULL, unscoped taxonomy model, on
     # the merged result — a field the LLM was never even asked about still
@@ -215,45 +235,44 @@ async def _call_tier(
             duration_ms=elapsed_ms(),
         )
         PARSE_MODEL_CALLS_TOTAL.labels(tier=tier_label, outcome="validation_failed").inc()
-        return None, None, None
+        return TierCallResult(None, None, None, failure_reason="validation_failed")
 
     log_event(event="llm_call_outcome", tier=tier_label, outcome="success", model=model_name, duration_ms=elapsed_ms())
     PARSE_MODEL_CALLS_TOTAL.labels(tier=tier_label, outcome="success").inc()
     token_logprobs = response.choices[0].logprobs.content if response.choices[0].logprobs else []
-    return validated_params, token_logprobs, llm_returned_fields
+    return TierCallResult(validated_params, token_logprobs, llm_returned_fields)
 
 
-# Routing only, not extraction: a single required field, so this never
-# needs logprobs (no confidence to measure off tokens) and stays far cheaper
-# than a full extraction call. Members come straight from the Vertical enum
-# — never a hand-typed list of category names to drift out of sync with it.
+# Nullable, same pattern every optional taxonomy field already uses.
+# Members come from the Vertical enum, never hand-typed.
 class _CategoryClassification(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    קטגוריה: Literal[tuple(vertical.value for vertical in Vertical)]
+    קטגוריה: Literal[tuple(vertical.value for vertical in Vertical)] | None
 
 
 _CATEGORY_FIELD_NAME = "קטגוריה"
-# One enum value plus JSON punctuation — comfortably bounds a pathological
-# runaway generation without ever constraining a normal answer.
 MAX_CLASSIFICATION_COMPLETION_TOKENS = 20
 
 
-async def run_category_classification(canonical_query: str) -> Vertical | None:
-    """Tiny Structured-Outputs call used only when the rule path found zero
-    taxonomy/cue-word evidence for every vertical (classification.confidence
-    == 0.0 in parse_service._resolve) — at that point classify_query's own
-    "winning" vertical is just Vertical's first-declared member via max()'s
-    tie-break, not a real pick. Deliberately a separate, single-field call
-    rather than folding category into the per-vertical extraction schema:
-    that would mean asking about all 3 verticals' ~60+ combined fields
-    before even knowing which one applies, reintroducing the exact
-    output-volume latency problem schema-scoping was adopted to avoid.
+@dataclass(frozen=True)
+class ClassificationOutcome:
+    """failed=True: the call itself errored -- degrade to the rule path's
+    default. failed=False, vertical=None: model explicitly said "none of
+    the three". failed=False, vertical=X: normal pick."""
 
-    Returns None on api_error or a malformed/invalid response — the caller
-    degrades to the rule path's own (defaulted) result rather than trusting
-    a category that isn't real either way.
-    """
+    vertical: Vertical | None
+    failed: bool
+
+    @classmethod
+    def api_failure(cls) -> "ClassificationOutcome":
+        return cls(vertical=None, failed=True)
+
+
+async def run_category_classification(canonical_query: str) -> ClassificationOutcome:
+    """Classify-only call for zero-signal queries (classification.confidence
+    == 0.0). Separate from extraction to avoid asking about all 3 verticals'
+    combined fields before knowing which one applies."""
     schema = _strict_json_schema(_CategoryClassification)
     messages = [
         {"role": "system", "content": build_classification_system_prompt()},
@@ -263,6 +282,7 @@ async def run_category_classification(canonical_query: str) -> Vertical | None:
         "type": "json_schema",
         "json_schema": {"name": "query_category", "schema": schema, "strict": True},
     }
+    log_event(level="DEBUG", event="llm_call_request", tier="classify", model=settings.openai_fallback_model, messages=messages)
 
     started_at = time.perf_counter()
 
@@ -285,12 +305,14 @@ async def run_category_classification(canonical_query: str) -> Vertical | None:
             duration_ms=elapsed_ms(),
         )
         PARSE_MODEL_CALLS_TOTAL.labels(tier="classify", outcome="api_error").inc()
-        return None
+        return ClassificationOutcome.api_failure()
 
     raw_content = response.choices[0].message.content or "{}"
+    log_event(level="DEBUG", event="llm_call_response", tier="classify", raw_content=raw_content)
     try:
         parsed = json.loads(raw_content)
-        vertical = Vertical(parsed[_CATEGORY_FIELD_NAME])
+        raw_category = parsed[_CATEGORY_FIELD_NAME]
+        vertical = Vertical(raw_category) if raw_category is not None else None
     except (json.JSONDecodeError, KeyError, ValueError):
         log_event(
             event="security_llm_validation_failed",
@@ -300,48 +322,55 @@ async def run_category_classification(canonical_query: str) -> Vertical | None:
             duration_ms=elapsed_ms(),
         )
         PARSE_MODEL_CALLS_TOTAL.labels(tier="classify", outcome="validation_failed").inc()
-        return None
+        return ClassificationOutcome.api_failure()
 
     log_event(
         event="llm_call_outcome",
         tier="classify",
         outcome="success",
         model=settings.openai_fallback_model,
-        vertical=vertical.value,
+        vertical=vertical.value if vertical is not None else None,
         duration_ms=elapsed_ms(),
     )
     PARSE_MODEL_CALLS_TOTAL.labels(tier="classify", outcome="success").inc()
-    return vertical
+    return ClassificationOutcome(vertical=vertical, failed=False)
 
 
 async def run_llm_fallback(
     vertical: Vertical, canonical_query: str, rule_path_params: BaseModel
 ) -> LlmFallbackResult:
-    tier1_params, tier1_logprobs, tier1_llm_fields = await _call_tier(
-        vertical, canonical_query, settings.openai_fallback_model, "tier1", rule_path_params
-    )
-    if tier1_params is not None:
+    tier1 = await _call_tier(vertical, canonical_query, settings.openai_fallback_model, "tier1", rule_path_params)
+    if tier1.params is not None:
         confidence = await compute_llm_confidence(
             canonical_query,
-            tier1_logprobs,
-            list(tier1_llm_fields.keys()),
-            tier1_params.model_dump(exclude_none=True),
+            tier1.token_logprobs,
+            list(tier1.llm_returned_fields.keys()),
+            tier1.params.model_dump(exclude_none=True),
             vertical,
         )
-        return LlmFallbackResult(params=tier1_params, confidence=confidence, tier_used="tier1")
+        return LlmFallbackResult(params=tier1.params, confidence=confidence, tier_used="tier1")
 
-    tier2_params, tier2_logprobs, tier2_llm_fields = await _call_tier(
-        vertical, canonical_query, settings.openai_escalation_model, "tier2", rule_path_params
-    )
-    if tier2_params is not None:
+    if tier1.failure_reason == "validation_failed":
+        # No escalation: a schema-valid response the model couldn't
+        # produce once is not more likely on a second, unrelated attempt.
+        log_event(event="llm_call_outcome", tier="tier2", outcome="skipped", reason="tier1_validation_failed")
+        return LlmFallbackResult(
+            params=rule_path_params,
+            confidence=DEGRADED_CONFIDENCE,
+            tier_used="degraded",
+            notes=[DEGRADED_NOTE],
+        )
+
+    tier2 = await _call_tier(vertical, canonical_query, settings.openai_escalation_model, "tier2", rule_path_params)
+    if tier2.params is not None:
         confidence = await compute_llm_confidence(
             canonical_query,
-            tier2_logprobs,
-            list(tier2_llm_fields.keys()),
-            tier2_params.model_dump(exclude_none=True),
+            tier2.token_logprobs,
+            list(tier2.llm_returned_fields.keys()),
+            tier2.params.model_dump(exclude_none=True),
             vertical,
         )
-        return LlmFallbackResult(params=tier2_params, confidence=confidence, tier_used="tier2")
+        return LlmFallbackResult(params=tier2.params, confidence=confidence, tier_used="tier2")
 
     return LlmFallbackResult(
         params=rule_path_params,

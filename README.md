@@ -5,12 +5,19 @@ A FastAPI service that converts a Hebrew free-text marketplace query
 search parameters for one of three Yad2 verticals (נדל״ן / רכב / יד_שנייה).
 A rule/dictionary classifier and extractor handle the majority of traffic
 at zero marginal cost; a two-tier OpenAI cascade — cheap model first,
-escalating only on validation failure, degrading gracefully rather than
-failing if that's unavailable — covers what rules genuinely can't resolve,
+escalating only on api_error (a validation failure degrades immediately,
+no escalation), degrading gracefully rather than failing if that's
+unavailable — covers what rules genuinely can't resolve,
 including a dedicated classify-only call for queries with zero taxonomy
 signal at all. Every field either path can emit comes straight out of
 `data/taxonomy.json`, dynamically, so no code path can invent a field
 outside the taxonomy.
+
+`category` is `Vertical | None`: a well-formed query that doesn't belong
+to any of the three verticals — or reads as an instruction rather than a
+search — returns `category: null`, not a forced guess. A deliberate
+contract change from a strict 3-value enum: forcing a wrong category on
+an out-of-domain or injection query is worse than an honest null.
 
 ## Pipeline
 
@@ -27,9 +34,6 @@ normalize (units, ranges, currency slang, typo+fuzzy correction)
 cache lookup ──hit────────────────────────────────────► return
    │ miss
    ▼
-identical request already in flight? ──yes──► await it, return
-   │ no
-   ▼
 rule/dictionary classify + extract
    │
    ├─ confidence >= 0.58 ──────────────► validate ─► cache write ─► return
@@ -37,14 +41,18 @@ rule/dictionary classify + extract
    ├─ 0 < confidence < 0.58 (partial signal, a real hint)
    │        │
    │        ▼
-   └─ confidence == 0.0 (zero signal) ─► classify-only LLM call ─► degrade honestly on failure
+   └─ confidence == 0.0 (zero signal) ─► classify-only LLM call
             │
-            ▼
+            ├─ call fails ──────────► degrade to rule path's default, confidence=0.15
+            ├─ explicit null ───────► category=null, confidence=0.0, cache write, return
+            ▼ (vertical picked)
       OpenAI Tier 1 (gpt-4.1-nano, cheap)
         │
         ├─ success ──────────────────────────────────► validate ─► cache write ─► return
         │
-        └─ validation failure / api_error
+        ├─ validation failure ─► degrade immediately, confidence=0.15 (no escalation)
+        │
+        └─ api_error
              │
              ▼
            OpenAI Tier 2 (gpt-4.1-mini, stronger)

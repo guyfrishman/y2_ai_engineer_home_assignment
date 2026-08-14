@@ -43,13 +43,19 @@ def _truncate(value):
     return value
 
 
-def log_event(**fields) -> None:
+def log_event(*, level: str = "INFO", **fields) -> None:
     """Emit one structured JSON log line, tagged with the current trace_id.
 
-    This is the one logging entry point in the app — decision-point events
-    (``cache_lookup``, ``parse_decision``, ``llm_call_outcome``, every
-    ``security_*`` event), the once-per-request ``request_completed``
-    summary, and the exception-boundary error event all go through this.
+    The one logging entry point in the app. ``level="DEBUG"`` for
+    step-by-step pipeline internals (sanitize/normalize/classify/extract
+    input+output, raw LLM request/response content); everything else
+    (cache hit/miss, path taken, tier/classification outcomes, the final
+    result) stays INFO. Actually filtered by LOG_LEVEL -- unlike a plain
+    logger.info(...) call, a DEBUG-level event costs nothing (not even the
+    json.dumps) when LOG_LEVEL=INFO.
     """
+    numeric_level = getattr(logging, level.upper(), logging.INFO)
+    if not logger.isEnabledFor(numeric_level):
+        return
     event = {"trace_id": trace_id_var.get(), **{key: _truncate(value) for key, value in fields.items()}}
-    logger.info(json.dumps(event, default=str, ensure_ascii=False))
+    logger.log(numeric_level, json.dumps(event, default=str, ensure_ascii=False))

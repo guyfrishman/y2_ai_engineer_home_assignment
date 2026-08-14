@@ -55,28 +55,32 @@ async def test_tier1_success_never_calls_tier2(monkeypatch):
     assert calls == [settings.openai_fallback_model]
 
 
-async def test_tier1_validation_failure_escalates_to_tier2(monkeypatch):
+async def test_tier1_validation_failure_does_not_escalate_to_tier2(monkeypatch):
+    # A schema-valid response the model couldn't produce once isn't more
+    # likely on a second, unrelated attempt -- only api_error escalates.
     calls = []
 
     async def fake_chat(messages, model, response_format=None, logprobs=False, max_completion_tokens=None):
         calls.append(model)
-        if model == settings.openai_fallback_model:
-            # "שנה" (year) must be a number per the taxonomy — this fails
-            # required-field/type validation, not an extra-field case.
-            return _fake_response({"שנה": "not-a-number"})
-        return _fake_response({"יצרן": "טויוטה", "דגם": "קורולה"})
+        # "שנה" (year) must be a number per the taxonomy — this fails
+        # required-field/type validation, not an extra-field case.
+        return _fake_response({"שנה": "not-a-number"})
 
     monkeypatch.setattr(llm_fallback_service.OpenAIRepository, "chat", staticmethod(fake_chat))
 
-    result = await llm_fallback_service.run_llm_fallback(Vertical.VEHICLES, "טויוטה קורולה", _rule_path_params())
+    rule_params = _rule_path_params()
+    result = await llm_fallback_service.run_llm_fallback(Vertical.VEHICLES, "טויוטה קורולה", rule_params)
 
-    assert result.tier_used == "tier2"
-    assert calls == [settings.openai_fallback_model, settings.openai_escalation_model]
-    assert result.params.model_dump(exclude_none=True) == {"יצרן": "טויוטה", "דגם": "קורולה"}
+    assert result.tier_used == "degraded"
+    assert calls == [settings.openai_fallback_model]  # tier2 never called
+    assert result.params is rule_params
 
 
-async def test_both_tiers_fail_validation_degrades_to_rule_path(monkeypatch):
+async def test_tier1_validation_failure_degrades_without_calling_tier2(monkeypatch):
+    calls = []
+
     async def fake_chat(messages, model, response_format=None, logprobs=False, max_completion_tokens=None):
+        calls.append(model)
         return _fake_response({"שנה": "not-a-number"})
 
     monkeypatch.setattr(llm_fallback_service.OpenAIRepository, "chat", staticmethod(fake_chat))
@@ -88,6 +92,7 @@ async def test_both_tiers_fail_validation_degrades_to_rule_path(monkeypatch):
     assert result.confidence == llm_fallback_service.DEGRADED_CONFIDENCE
     assert result.params is rule_params
     assert llm_fallback_service.DEGRADED_NOTE in result.notes
+    assert calls == [settings.openai_fallback_model]
 
 
 async def test_tier1_api_error_escalates_to_tier2(monkeypatch):
@@ -206,7 +211,8 @@ async def test_category_classification_success_logs_the_chosen_vertical(monkeypa
 
     result = await llm_fallback_service.run_category_classification("ג'יפ קטן")
 
-    assert result == Vertical.VEHICLES
+    assert result.vertical == Vertical.VEHICLES
+    assert result.failed is False
     assert logged["event"] == "llm_call_outcome"
     assert logged["tier"] == "classify"
     assert logged["outcome"] == "success"

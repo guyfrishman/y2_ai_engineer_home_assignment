@@ -8,8 +8,6 @@ from logger import log_event
 from metrics import record_token_usage_and_cost
 
 Message = dict[str, str]
-OPENAI_REQUEST_TIMEOUT_SECONDS = 5.0
-OPENAI_MAX_RETRIES = 0
 _OPENAI_CONNECTION_LIMITS = httpx2.Limits(max_connections=2000, max_keepalive_connections=200)
 
 
@@ -26,8 +24,8 @@ class OpenAIRepository:
         if cls._client is None:
             cls._client = AsyncOpenAI(
                 api_key=settings.openai_api_key,
-                timeout=OPENAI_REQUEST_TIMEOUT_SECONDS,
-                max_retries=OPENAI_MAX_RETRIES,
+                timeout=settings.openai_request_timeout_seconds,
+                max_retries=settings.openai_max_retries,
                 http_client=httpx2.AsyncClient(limits=_OPENAI_CONNECTION_LIMITS),
             )
         return cls._client

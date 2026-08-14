@@ -1,7 +1,9 @@
 import json
+import math
 import re
 from types import SimpleNamespace
 
+from config import settings
 from schema.taxonomy_models import Vertical
 from services import llm_confidence_service
 from services.llm_confidence_service import (
@@ -206,3 +208,61 @@ async def test_embedding_unavailable_fallback_is_logged(monkeypatch):
     assert "confidence_embedding_cross_check_unavailable" in events
     final = next(e for e in logged_events if e["event"] == "confidence_computed")
     assert final["embedding_outcome"] == "unavailable_fell_back_to_logprob_only"
+
+
+# --- Item 4 acceptance: embedding_similarity veto ---
+
+
+async def test_vetoed_below_threshold_at_embedding_similarity_zero(monkeypatch):
+    # The injection-attempt repro case: embedding_similarity=0.0.
+    async def fake_embed(text, model=None):
+        return [1.0, 0.0] if text == "QUERY" else [0.0, 1.0]
+
+    monkeypatch.setattr(llm_confidence_service.OpenAIRepository, "embed", staticmethod(fake_embed))
+
+    json_text = json.dumps({"עיר": "תל אביב-יפו"}, ensure_ascii=False)
+    tokens = _fabricate_tokens(json_text, uncertain_substrings=[], certain_logprob=-0.001)  # near-certain logprob
+    confidence = await compute_llm_confidence("QUERY", tokens, ["עיר"], {"עיר": "תל אביב-יפו"}, Vertical.REAL_ESTATE)
+    assert confidence < settings.confidence_threshold
+    assert confidence <= llm_confidence_service.CONFIDENCE_CEILING_ON_MISMATCH
+
+
+async def test_vetoed_below_threshold_at_embedding_similarity_0_42(monkeypatch):
+    # The gaming-monitor repro case: embedding_similarity=0.42.
+    async def fake_embed(text, model=None):
+        return [1.0, 0.0] if text == "QUERY" else [0.42, math.sqrt(1 - 0.42**2)]
+
+    monkeypatch.setattr(llm_confidence_service.OpenAIRepository, "embed", staticmethod(fake_embed))
+
+    json_text = json.dumps({"מחיר": 1500}, ensure_ascii=False)
+    tokens = _fabricate_tokens(json_text, uncertain_substrings=[], certain_logprob=-0.001)
+    confidence = await compute_llm_confidence("QUERY", tokens, ["מחיר"], {"מחיר": 1500}, Vertical.USED_GOODS)
+    assert confidence < settings.confidence_threshold
+
+
+async def test_legitimate_high_similarity_extraction_is_not_vetoed(monkeypatch):
+    # Must not regress: a well-matched extraction (high logprob,
+    # embedding_similarity comfortably above the floor) stays high.
+    async def fake_embed(text, model=None):
+        return [1.0, 0.0] if text == "QUERY" else [0.9, math.sqrt(1 - 0.9**2)]
+
+    monkeypatch.setattr(llm_confidence_service.OpenAIRepository, "embed", staticmethod(fake_embed))
+
+    json_text = json.dumps({"מחיר": 1500}, ensure_ascii=False)
+    tokens = _fabricate_tokens(json_text, uncertain_substrings=[], certain_logprob=-0.001)
+    confidence = await compute_llm_confidence("QUERY", tokens, ["מחיר"], {"מחיר": 1500}, Vertical.USED_GOODS)
+    assert confidence >= settings.confidence_threshold
+
+
+async def test_embedding_similarity_exactly_at_floor_is_not_vetoed(monkeypatch):
+    # Boundary: < floor vetoes, == floor does not.
+    async def fake_embed(text, model=None):
+        floor = llm_confidence_service.EMBEDDING_SIMILARITY_FLOOR
+        return [1.0, 0.0] if text == "QUERY" else [floor, math.sqrt(1 - floor**2)]
+
+    monkeypatch.setattr(llm_confidence_service.OpenAIRepository, "embed", staticmethod(fake_embed))
+
+    json_text = json.dumps({"מחיר": 1500}, ensure_ascii=False)
+    tokens = _fabricate_tokens(json_text, uncertain_substrings=[], certain_logprob=-0.001)
+    confidence = await compute_llm_confidence("QUERY", tokens, ["מחיר"], {"מחיר": 1500}, Vertical.USED_GOODS)
+    assert confidence >= settings.confidence_threshold
