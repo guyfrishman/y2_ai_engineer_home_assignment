@@ -65,9 +65,27 @@ async def parse_query(raw_query: str) -> ParseResult:
         _in_flight_requests[cache_key] = future
         try:
             resolved = await _resolve(canonical_query, cache_key)
-        except Exception as error:
-            future.set_exception(error)
-            future.exception()  # mark retrieved so a future nobody else awaited doesn't warn on GC
+        except BaseException as error:
+            # BaseException, not Exception: asyncio.CancelledError is a
+            # BaseException (not an Exception, since Python 3.8), and this
+            # resolving request's own task is exactly what a graceful
+            # shutdown cancels once the grace period elapses. If that
+            # cancellation isn't caught here, the future is never settled
+            # -- any concurrent coalesced waiter (`await existing_future`
+            # above) hangs forever, since nothing else ever resolves it.
+            # Confirmed directly, not assumed: reproduced this hang before
+            # adding this handler.
+            if not future.done():
+                # A bare CancelledError propagating into an unrelated
+                # waiter's task is surprising (asyncio treats it as that
+                # task's own cancellation, not a normal catchable error) --
+                # wrap it so coalesced waiters see a plain, catchable
+                # failure instead. The resolving task's own cancellation
+                # semantics are unaffected: the original `error` is what
+                # gets re-raised below, not this wrapped copy.
+                waiter_error = error if isinstance(error, Exception) else RuntimeError(f"in-flight resolution did not complete: {error!r}")
+                future.set_exception(waiter_error)
+                future.exception()  # mark retrieved so a future nobody else awaited doesn't warn on GC
             raise
         else:
             future.set_result(resolved)

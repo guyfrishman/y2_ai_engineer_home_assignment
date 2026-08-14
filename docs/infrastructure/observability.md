@@ -53,7 +53,48 @@ real loadtest run instead of a synthetic dashboard export.
 - `GET /health` reports `{"status": "ok", "taxonomy_version": "..."}` — a
   readiness signal that also surfaces which taxonomy build is loaded,
   useful when diagnosing a cache-key mismatch after a taxonomy update.
+  The `Dockerfile` also declares a `HEALTHCHECK` hitting this same
+  endpoint (stdlib `urllib` — the slim runtime image has no `curl`/`wget`,
+  and `/health` needs no credentials since it's unauthenticated by design;
+  see `app/security.py`), so `docker ps`/orchestrators can see container
+  health without a sidecar probe.
 - SLO targets are the brief's own: p95 ≤150ms cache/rules path, p95 ≤600ms
   model path, ≥12 QPS per instance. `scripts/loadtest.py` measures and
   prints PASS/FAIL against exactly these numbers — see the root README for
-  a real captured run.
+  a real captured run. It also supports `--llm-ratio` to hold the LLM-path
+  traffic share at an explicit target (see
+  `docs/infrastructure/latency-investigation.md`'s Docker/infra
+  investigation section) for controlled concurrency-vs-mix comparisons.
+
+## Multi-replica scaling: validated, with a real cache-hit-rate cost
+
+3 independent replicas were temporarily stood up behind an nginx reverse
+proxy as one-off validation infrastructure (not a shipped deployment
+shape) — the concrete end-to-end validation of "scale via replicas, not
+`--workers`" (this doc's Prometheus-registry note above, and
+`docs/services/search-api.md`'s Quirks section). Confirmed working
+(direct round-robin check: 6 requests split 2/2/2 across the three
+containers' own logs) and confirmed **not** a free win:
+
+- **Each replica keeps its own independent in-memory cache — there is no
+  shared cache across replicas.** A query that would be a cache hit on a
+  single instance can independently miss on whichever replica the load
+  balancer happens to route it to. Measured directly: the same reproducer
+  scenario that shows 6 fresh (`rules`-path, i.e. cache-miss) resolutions
+  on a single instance shows **18** across 3 replicas — a 3x increase,
+  exactly tracking the replica count, not incidental noise. At real
+  production traffic volumes with a Zipfian query distribution (a small
+  number of popular queries dominating traffic — see
+  `docs/decisions/0001-hybrid-rule-first-llm-fallback-pipeline.md`'s
+  write-behind discussion), this means the *effective* aggregate cache-hit
+  rate assumed by `docs/infrastructure/cost-model.md`'s projections is
+  optimistic for a multi-replica deployment as configured here — a shared
+  cache (Redis, behind the existing `CacheRepository` interface —
+  `docs/conventions/repositories.md` already documents this as a
+  drop-in swap) would be the natural fix if replica count grows enough
+  for this to matter in practice.
+- **It did not measurably improve the cache/rules p95 degradation under
+  concurrent LLM load** in this project's test environment — see
+  `docs/infrastructure/latency-investigation.md`'s multi-replica section
+  for the full numbers and why that result argues for an infrastructure
+  cause shared across all replicas, not a per-instance capacity limit.

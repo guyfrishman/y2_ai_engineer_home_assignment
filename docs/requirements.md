@@ -110,35 +110,41 @@ burst concurrent traffic from one API key), and cache/rules p95 also
 degrading to 200-700ms in the same runs, despite that code path doing no
 network I/O of its own.
 
-**Two candidate causes were tested directly and both ruled out.**
+**Seven candidate causes have now been tested directly across two
+investigation rounds, and all seven are ruled out.** Round one:
 `@log_activity` (a per-function decorator emitting a `json.dumps` +
-recursive truncation on every call) was a plausible culprit and has since
-been removed entirely (see `conventions/logging.md`) in favor of explicit
-`log_event` calls at real decision points. Re-running the same loadtest at
-the same concurrency after that change: cache/rules p95 was still
-200-700ms — not improved. Across three separate runs, the pattern holds
-regardless of logging: cache-only traffic is consistently fast (~50ms);
-any run with real concurrent LLM traffic present shows the degradation,
-`@log_activity` present or not.
+recursive truncation on every call) was removed entirely (see
+`conventions/logging.md`) and re-tested — cache/rules p95 unchanged
+(still 200-700ms). The classifier's per-request taxonomy-term scan
+(`classifier_service._scan_term_occurrences`, 241 compiled regex patterns
+per query) was profiled directly: ~0.11ms per call, ~0.14ms for the full
+pipeline, ~2.8ms worst-case aggregate at 20 concurrent requests — three
+orders of magnitude short of what's observed. Round two (full methodology
+and every number: `infrastructure/latency-investigation.md`'s
+"Docker/infra investigation" section) tested infra/networking candidates
+specifically: raw CPU/memory saturation (ruled out — max 23-25% of 24
+cores via `docker stats`), uvicorn's `--backlog`/`--timeout-keep-alive`
+tuning (no reproducible improvement), the AsyncOpenAI client's
+connection-pool size (premise refuted — the SDK already configures a far
+more generous pool than assumed; no effect), and 3x replica capacity
+behind a real nginx load balancer (no reproducible improvement, and a
+confirmed real cost: cache-hit rate drops since each replica keeps its
+own independent cache).
 
-The classifier's per-request taxonomy-term scan
-(`classifier_service._scan_term_occurrences`, O(number of taxonomy terms)
-— 241 compiled regex patterns checked against every query) was the other
-real CPU-bound cost on the rules path, and looked like a plausible
-candidate for the same reason. Profiled directly rather than assumed
-(`infrastructure/latency-investigation.md`): ~0.11ms per call, ~0.14ms for
-the full sanitize→normalize→classify→extract pipeline. Even the
-pathological worst case — 20 concurrent requests serializing entirely
-behind each other on the GIL — is ~2.8ms of aggregate queueing, three
-orders of magnitude short of the 200-700ms observed. Ruled out; no
-n-gram-lookup rewrite was implemented, since there's no meaningful cost
-here to recover.
-
-Both point toward infra-level contention (client connection pooling, or
-Docker Desktop's networking layer under sustained external call volume)
-rather than a code regression — not isolated further than that, but two
-concrete "it's this code" explanations are now tested and rejected, not
-live ones.
+**What is confirmed, not just ruled out:** a direct A/B test at fixed
+concurrency (LLM-path traffic present vs. completely absent) shows the
+stall only appears with concurrent LLM traffic — 0/144 vs. 26/129 cache
+requests over 100ms — and the slow requests cluster tightly around one
+latency value rather than spreading out, the signature of a shared
+blocking resource releasing a batch of waiters together, not a
+per-request cost. None of the seven tested candidates are that resource.
+The leading remaining hypothesis, not yet isolated: infrastructure shared
+across every instance alike (all of them, including the 3-replica setup,
+still sit behind the same Docker Desktop WSL2 network translation layer
+between this project's test client and its containers) — confirming that
+specific layer needs a different test environment (bare-Linux Docker, or
+a loadtest client co-located inside the Docker network) than was
+available for this investigation.
 
 **The credible paths to closing the core gap, honestly not yet
 implemented:** scoping the `יד_שנייה` schema to the rule path's candidate

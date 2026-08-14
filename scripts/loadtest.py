@@ -19,6 +19,7 @@ misleadingly fast "llm" numbers as if they were real model latency.
 
 import argparse
 import asyncio
+import random
 import time
 from dataclasses import dataclass, field
 
@@ -71,7 +72,16 @@ def _percentile(values: list[float], fraction: float) -> float:
 async def _send_one(client: httpx.AsyncClient, query: str, semaphore: asyncio.Semaphore) -> RequestOutcome:
     async with semaphore:
         started_at = time.perf_counter()
-        response = await client.post("/parse", json={"q": query})
+        try:
+            response = await client.post("/parse", json={"q": query})
+        except httpx.HTTPError:
+            # A hard connection reset (e.g. uvicorn's --limit-concurrency
+            # dropping a connection rather than returning a clean 503, seen
+            # during the queueing investigation) is a real outcome to count,
+            # not a reason to crash the whole run and lose every other
+            # in-flight result.
+            duration_seconds = time.perf_counter() - started_at
+            return RequestOutcome(path=None, duration_seconds=duration_seconds, status_code=0)
         duration_seconds = time.perf_counter() - started_at
         return RequestOutcome(
             path=response.headers.get("x-parse-path"),
@@ -88,8 +98,60 @@ def _build_query_plan(total_requests: int) -> list[str]:
     return plan[:total_requests]
 
 
-async def run_loadtest(base_url: str, total_requests: int, concurrency: int) -> LoadTestResults:
-    query_plan = _build_query_plan(total_requests)
+# "דירת" (construct form) never matches the taxonomy's "דירה" -- a documented
+# confidence gap (see docs/infrastructure/confidence-calibration.md) that
+# reliably keeps every generated variant below confidence_threshold regardless
+# of room count/city/price (verified: 30/30 sampled below 0.58). Used only by
+# --llm-ratio below, where a sustained target ratio needs many distinct
+# LLM-triggering queries -- cycling the fixed 4-query LLM_PATH_QUERIES pool
+# collapses into cache hits (and, with in-flight coalescing, a single shared
+# call) after the first occurrence of each, so it can't sustain a requested
+# ratio of real fallback traffic over a long run.
+_LOW_CONFIDENCE_CITIES = ["ירושלים", "תל אביב", "חיפה", "באר שבע", "נתניה", "אשדוד", "ראשון לציון", "פתח תקווה"]
+_LOW_CONFIDENCE_ROOM_COUNTS = [1, 2, 3, 4, 5]
+_LOW_CONFIDENCE_PRICE_CEILINGS = [600000, 900000, 1200000, 1500000, 1800000]
+
+
+def _generate_low_confidence_queries(count: int) -> list[str]:
+    queries = []
+    for i in range(count):
+        city = _LOW_CONFIDENCE_CITIES[i % len(_LOW_CONFIDENCE_CITIES)]
+        rooms = _LOW_CONFIDENCE_ROOM_COUNTS[i % len(_LOW_CONFIDENCE_ROOM_COUNTS)]
+        price = _LOW_CONFIDENCE_PRICE_CEILINGS[i % len(_LOW_CONFIDENCE_PRICE_CEILINGS)]
+        queries.append(f"דירת {rooms} חדרים ב{city} עד {price} שח")
+    return queries
+
+
+def _build_query_plan_with_llm_ratio(total_requests: int, llm_ratio: float) -> list[str]:
+    """Same cache/rules/llm shape as _build_query_plan, but with the LLM-path
+    share held at an explicit target ratio via distinct generated queries,
+    for controlled concurrency-vs-ratio comparisons (see
+    docs/infrastructure/latency-investigation.md's queueing-hypothesis
+    section). Deterministically shuffled so repeated runs at the same
+    parameters are comparable."""
+    llm_count = round(total_requests * llm_ratio)
+    other_count = total_requests - llm_count
+    llm_queries = _generate_low_confidence_queries(llm_count)
+
+    other_pool = [CACHE_QUERY] * 3 + RULES_PATH_QUERIES
+    other_queries = []
+    while len(other_queries) < other_count:
+        other_queries.extend(other_pool)
+    other_queries = other_queries[:other_count]
+
+    combined = llm_queries + other_queries
+    random.Random(42).shuffle(combined)
+    return combined
+
+
+async def run_loadtest(
+    base_url: str, total_requests: int, concurrency: int, llm_ratio: float | None = None
+) -> LoadTestResults:
+    query_plan = (
+        _build_query_plan_with_llm_ratio(total_requests, llm_ratio)
+        if llm_ratio is not None
+        else _build_query_plan(total_requests)
+    )
     semaphore = asyncio.Semaphore(concurrency)
 
     async with httpx.AsyncClient(base_url=base_url, timeout=30.0) as client:
@@ -110,6 +172,20 @@ def _print_report(results: LoadTestResults) -> None:
         by_path.setdefault(outcome.path or "unknown", []).append(outcome.duration_seconds)
 
     print(f"\nTotal requests: {len(results.outcomes)}  (failed: {failed_count})")
+    if failed_count:
+        failure_status_counts: dict[int, int] = {}
+        for outcome in results.outcomes:
+            if outcome.status_code != 200:
+                failure_status_counts[outcome.status_code] = failure_status_counts.get(outcome.status_code, 0) + 1
+        # status_code 0 = a transport-level failure (connection reset/refused)
+        # rather than an HTTP response at all -- e.g. uvicorn's
+        # --limit-concurrency dropping a connection instead of returning a
+        # clean 503. Reported separately since it's a harsher failure mode
+        # than a normal error status.
+        breakdown = ", ".join(
+            f"{'connection-reset' if code == 0 else code}: {count}" for code, count in sorted(failure_status_counts.items())
+        )
+        print(f"Failure breakdown: {breakdown}")
     print(f"Wall-clock time: {results.wall_clock_seconds:.2f}s")
     print(f"Measured QPS: {qps:.2f}\n")
 
@@ -157,10 +233,17 @@ def main() -> None:
     parser.add_argument("--base-url", default="http://localhost:8000")
     parser.add_argument("--requests", type=int, default=200)
     parser.add_argument("--concurrency", type=int, default=20)
+    parser.add_argument(
+        "--llm-ratio",
+        type=float,
+        default=None,
+        help="Hold the LLM-path share of traffic at this fraction (e.g. 0.5) using distinct "
+        "generated queries instead of the fixed 8-query mix, for controlled ratio experiments.",
+    )
     args = parser.parse_args()
 
     print(f"Running loadtest against {args.base_url} — {args.requests} requests, concurrency {args.concurrency}")
-    results = asyncio.run(run_loadtest(args.base_url, args.requests, args.concurrency))
+    results = asyncio.run(run_loadtest(args.base_url, args.requests, args.concurrency, args.llm_ratio))
     _print_report(results)
 
 

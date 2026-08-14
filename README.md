@@ -91,11 +91,22 @@ cd api && uv run python ../scripts/loadtest.py --requests 200 --concurrency 20
 
 Cache/rules p95 passes (≤150ms) at moderate concurrency, but **degrades to
 200-700ms under heavy concurrent real-LLM traffic** — still an open
-question as to the exact mechanism, though two plausible causes
-(`@log_activity`'s per-call logging overhead, and the classifier's
-per-request taxonomy-term scan) were profiled and measured, not assumed,
-and both ruled out as negligible (microseconds, not the hundreds of
-milliseconds observed). The 600ms model-path target fails outright —
+question as to the exact mechanism, though seven plausible causes across
+two investigation rounds were profiled and measured, not assumed, and all
+seven ruled out as the cause: `@log_activity`'s per-call logging overhead,
+the classifier's per-request taxonomy-term scan, raw CPU/memory
+saturation, uvicorn backlog/keep-alive tuning, the OpenAI client's
+connection-pool size, and — the biggest lever tried — 3x replica capacity
+behind a real load balancer. What *is* confirmed: the stall only appears
+with concurrent LLM-path traffic present (a direct A/B test: 0/144 vs.
+26/129 requests over 100ms at identical concurrency), and it clusters
+tightly around one latency value rather than spreading out — the
+signature of a shared blocking resource, most likely infrastructure every
+replica sits behind alike (the Docker Desktop WSL2 network layer between
+this project's test client and its containers), not this codebase's own
+request-handling. Full methodology, every number, and what a follow-up
+would need: `docs/infrastructure/latency-investigation.md`. The 600ms
+model-path target fails outright —
 measured p95 well into multi-second territory against the real API, root
 caused (not just observed): Structured Outputs strict mode forces every
 optional field into the response as an explicit `null`, so a 20-28-field

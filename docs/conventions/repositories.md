@@ -60,6 +60,24 @@ so a fast coalesced wait is never conflated with a genuine fresh
 rules/LLM resolution. See `parse_service.parse_query` and
 `tests/test_parse_service.py`'s coalescing tests.
 
+**The owning request's future must be settled even if its own task is
+cancelled, not just on a normal exception.** A graceful shutdown cancels
+whatever task is still resolving once the grace period elapses; since
+`asyncio.CancelledError` is a `BaseException`, not an `Exception`, catching
+only `except Exception` around the resolving `await` looks correct but
+silently skips settling the future on cancellation — confirmed by direct
+reproduction, not assumed (see
+`docs/infrastructure/latency-investigation.md`'s Docker/infra
+investigation): any concurrent waiter coalescing onto that future then
+hangs indefinitely, since nothing else was ever going to resolve it.
+Fixed by catching `BaseException`, wrapping a bare `CancelledError` as a
+plain `RuntimeError` before setting it on the future (so it reads as a
+normal catchable failure to the waiter rather than bleeding an unrelated
+cancellation into that waiter's own task), and still re-raising the
+original error so the cancelled task's own cancellation semantics are
+unaffected. Regression test:
+`tests/test_parse_service.py::test_cancelling_the_resolving_request_does_not_hang_coalesced_waiters`.
+
 **To swap the backing store** (Redis, Memcached), write a new class that
 implements `CacheRepository` and change that one construction line. No
 service or router changes.

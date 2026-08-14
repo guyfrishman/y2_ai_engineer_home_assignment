@@ -380,3 +380,260 @@ concurrent LLM load remains an open question, still most likely
 infra-level contention (client connection pooling, or Docker Desktop's
 networking layer under sustained external call volume) rather than
 anything in this codebase's own CPU-bound work.
+
+## Docker/infra investigation: five more candidates tested, one real bug found elsewhere
+
+The two app-level CPU hypotheses above were ruled out by three orders of
+magnitude. This round assumed the cause is infra/networking, not CPU, and
+tested five specific candidates directly against a real `docker compose`
+deployment (Docker Desktop, Windows, WSL2 backend) with a real
+`OPENAI_API_KEY`. `scripts/loadtest.py` gained a `--llm-ratio` flag for
+this round — the original fixed 4-query LLM pool collapses into cache
+hits (and, with in-flight coalescing, a single shared call) after each
+query's first occurrence, so it can't sustain a target ratio of real
+fallback traffic over a long run; `--llm-ratio` generates many distinct
+sub-threshold real-estate queries (the documented "דירת" construct-form
+gap, verified 30/30 below `confidence_threshold` before use) to hold a
+requested LLM-path share steady instead.
+
+### 1. Confound check: is this just CPU saturation? No — checked directly
+
+**Where the client runs matters here and wasn't previously stated
+explicitly:** `scripts/loadtest.py` runs on the Windows/MSYS host;
+Docker Desktop's WSL2 backend runs the container inside a Linux VM. Every
+request crosses a virtualized network hop (Windows host → WSL2 VM) that a
+bare-Linux Docker host wouldn't have — relevant context for everything
+below, not itself proven to be the cause.
+
+`docker stats` polled during a concurrency-20 loadtest run that reproduced
+the degradation (cache/rules p95 476.9ms, well past the 150ms target):
+**CPU never exceeded 23.4%** of the host's 24 cores (effectively a
+fraction of even one core — Docker's `CPUPerc` normalizes so 100% = one
+full core saturated). Memory stayed flat around 90MiB. Repeated across
+three independent runs (different request counts/concurrency): same
+result every time, max observed 25%.
+
+**Conclusion: not CPU-bound.** This matches (and reinforces) the earlier
+classifier-hot-path profiling — there is no CPU saturation happening
+anywhere during the degraded window. The rest of this investigation
+proceeds on that basis.
+
+### 2. Queueing hypothesis: a controlled concurrency × LLM-ratio matrix — inconclusive on its own, but a follow-up test was decisive
+
+**Working hypothesis stated before testing:** a ~2.6s LLM-path request
+occupies its slot ~65x longer than a ~40ms rules-path request, so long-held
+slow requests might starve capacity for fast ones — a queueing effect, not
+a CPU one.
+
+Four runs (150 requests each, fresh cache per run), concurrency ∈ {10, 20}
+× LLM-path ratio ∈ {10%, 50%}:
+
+| Concurrency | LLM ratio | cache/rules p95 | LLM p95 |
+|---|---|---|---|
+| 10 | 10% | 220.4ms (FAIL) | 3,136.5ms |
+| 10 | 50% | **56.6ms (PASS)** | 3,314.3ms |
+| 20 | 10% | 223.3ms (FAIL) | 2,778.6ms |
+| 20 | 50% | 228.6ms (FAIL) | 2,958.4ms |
+
+**This does not cleanly support the stated hypothesis.** At concurrency 20,
+raising the LLM ratio from 10% to 50% barely moved cache/rules p95 (223 →
+229ms) — if long-held slow requests were starving fast ones proportionally,
+5x more of them should have made it meaningfully worse. At concurrency 10,
+raising the ratio made it *better* (220 → 57ms), the opposite of the
+predicted direction. Reported plainly rather than cherry-picked: **the 2×2
+matrix does not show a clean, monotonic relationship with either variable
+individually.**
+
+**A follow-up test, not originally planned, was decisive where the matrix
+wasn't.** Inspecting the full cache-path latency distribution (not just
+p50/p95) for one degraded run (concurrency 20, ratio 10%, n=129 cache
+requests) showed it is sharply **bimodal**, not a smooth shift:
+
+```
+min/p10/p25/p50/p75/p90/p95/p99 (ms): 9.2, 13.9, 44.1, 48.3, 52.2, 343.4, 365.6, 366.3
+count > 100ms: 26 (of 129)
+top 10 slowest (ms): 364.5, 364.8, 365.0, 365.6, 365.6, 365.7, 365.9, 366.2, 366.3, 366.3
+```
+
+112/129 requests land in the normal 9-52ms band; 17 requests cluster
+**tightly within a 1.8ms band around 365ms** — nearly identical values,
+the signature of a batch of requests released together by one shared
+blocking condition, not independent per-request jitter.
+
+**Direct A/B test: same concurrency (20), LLM ratio 10% vs. 0% (pure
+cache/rules traffic, zero LLM-path queries).** At ratio 0%: **0/144 cache
+requests over 100ms**, p95 51.1ms, clean pass. At ratio 10%: 26/129 over
+100ms, p95 223ms. This is unambiguous: **the stall only appears when
+concurrent LLM-path traffic is present.** The queueing hypothesis's core
+mechanism — slow in-flight requests affecting fast ones' latency — is
+confirmed causally, even though the small 2×2 matrix's specific dose-response
+wasn't clean (likely small llm-call counts, 15-75 per run, combined with
+incidental interleaving order under a deterministic shuffle — timing luck,
+not a refutation of the mechanism).
+
+**What remains open:** *which* shared resource the stalled requests are
+blocked on isn't pinned down by this test alone. The tight clustering
+argues for something that releases a batch of waiters at once (a pool,
+queue, or proxy layer) rather than a per-request cost. Items 3-5 test the
+most likely candidates directly.
+
+### 3. Uvicorn tuning (`--backlog`, `--limit-concurrency`, `--timeout-keep-alive`) — no reproducible improvement, and a real 503/reset trade-off confirmed
+
+Added to the `Dockerfile` `CMD`: `--backlog 4096` (2x uvicorn's default
+2048), `--limit-concurrency 100` (uvicorn's own default is unlimited),
+`--timeout-keep-alive 5` (matches uvicorn's default, made explicit).
+
+Same reproducer scenario (concurrency 20, ratio 10%) run 3x untuned and 3x
+tuned, fresh cache each time:
+
+| | Untuned p95 | Tuned p95 |
+|---|---|---|
+| Run 1 | 223.3ms | 633.2ms |
+| Run 2 | 458.4ms | 218.8ms |
+| Run 3 | 215.6ms | 263.0ms |
+
+**No reproducible improvement.** The tuned and untuned ranges overlap
+completely (215-458ms untuned, 219-633ms tuned) — run-to-run variance is
+larger than any effect the tuning produced. `--backlog`/`--timeout-keep-alive`
+at these values don't move the needle on this bottleneck.
+
+**`--limit-concurrency` set too low is a real, severe failure mode —
+demonstrated, not just asserted.** Set to 5 (deliberately low) and hit
+with concurrency-20 pure cache/rules traffic (no LLM calls, so this is
+cheap to demonstrate): **133 clean 503s + 2 hard connection resets out of
+150 requests — a 90% failure rate.** The connection resets
+(`httpcore.ReadError` on the client) also crashed `loadtest.py` itself,
+since `_send_one` didn't catch transport-level errors — fixed alongside
+this (now counted as a `connection-reset` outcome in the failure
+breakdown rather than aborting the whole run). Restored to `100` (well
+above any concurrency this service has been tested at) before continuing.
+**This is exactly the trade-off to watch for in production: a
+"safety" limit set without headroom turns a slow-request problem into an
+outright-rejected-request problem, and not even always as a clean 503.**
+
+### 4. AsyncOpenAI connection pool — the premise didn't hold; checked directly, not assumed
+
+**Checked before configuring anything:** does `OpenAIRepository`'s
+`AsyncOpenAI` client actually use bare httpx defaults
+(`max_connections=100, max_keepalive_connections=20`)? **No.**
+`openai` 3.0.0's own `_constants.py` sets
+`DEFAULT_CONNECTION_LIMITS = httpx2.Limits(max_connections=1000,
+max_keepalive_connections=100)` on its vendored `httpx2` transport — 5x
+more generous than the commonly-cited bare-httpx numbers the premise
+assumed. This service's own test concurrency (max 20, and at most one real
+call in flight per distinct query thanks to in-flight coalescing) never
+gets remotely close to even the *unconfigured* limit.
+
+Implemented anyway, for completeness and because the user-facing ceiling
+should be a documented, intentional value rather than an SDK internal a
+future reader has to go looking for: explicit `httpx2.Limits(max_connections=2000,
+max_keepalive_connections=200)` passed via `AsyncOpenAI(http_client=...)`
+in `openai_repository.py`. Re-ran the reproducer scenario twice: 639.2ms,
+216.4ms — same overlapping range as every other variant tried, no
+distinguishable effect. **Exactly the result predicted once the premise
+was refuted** — this was not expected to help, and it didn't.
+
+### 5. Multi-replica validation — the big one, and the most surprising result
+
+Temporarily stood up three replicas (`api1`, `api2`, `api3`, each the
+unmodified service image) behind an `nginx:1.27-alpine` reverse proxy on
+its own port, to actually test — not just assert — "scale via replicas,
+not `--workers`" (this doc's earlier sections, `docs/services/search-api.md`'s
+Quirks section). Explicit per-replica names, not Compose `deploy.replicas`
+plus nginx's own hostname-based upstream resolution: nginx resolves a
+proxied hostname once at startup, not per request, without the dynamic
+`resolver` directive, so a naive `proxy_pass http://api:8000` against a
+scaled service can silently pin to one replica instead of actually
+load-balancing. Verified round-robin directly (6 `/health` requests →
+2/2/2 split across the three containers' own logs) before trusting any
+latency numbers from it. This was throwaway validation infrastructure for
+this one investigation, not a shipped deployment shape — torn down after
+the run below; the default deployment stays the single-instance
+`docker-compose.yml`.
+
+Same reproducer scenario (concurrency 20, ratio 10%), 3 runs, fresh cache
+each time:
+
+| Run | Single-instance p95 (item 3/4 baseline) | 3-replica p95 |
+|---|---|---|
+| 1 | 223-633ms (range across items 3-4) | 656.1ms |
+| 2 | " | 239.6ms |
+| 3 | " | 219.1ms |
+
+**No reproducible improvement from 3x the capacity.** The multi-replica
+range (219-656ms) sits inside the same noise band every single-instance
+variant already showed. This is a genuinely surprising, negative result:
+tripling backend capacity behind a working load balancer did not fix the
+degradation.
+
+**The cache-hit-rate cost predicted in advance did materialize, exactly as
+expected:** each replica keeps its own independent in-memory cache — there
+is no shared cache across replicas. The `rules` path count (fresh
+classifications, not cache hits) went from **6 on a single instance to 18
+across three replicas** — a 3x increase, because a repeated query that
+would hit one shared cache now independently misses on whichever replica
+nginx happens to route it to first. **Real cost, no matching latency
+benefit measured in this environment.**
+
+**What this result means for the open question:** if adding independent,
+fully-capable replicas behind a real load balancer doesn't move cache/rules
+p95 at all, the bottleneck most likely sits *upstream of every replica* —
+shared infrastructure all instances sit behind equally, not per-instance
+capacity. The strongest remaining candidate, consistent with item 1's
+explicitly-flagged confound: the Docker Desktop WSL2 network translation
+layer between the Windows-host test client and the Linux containers (or
+the test client's own connection handling under concurrent slow+fast
+request mixing) — something this investigation cannot isolate further
+without either a bare-Linux Docker host (no WSL2/Windows NAT hop) or a
+loadtest client run *inside* the Docker network instead of from the host,
+both worth a dedicated follow-up.
+
+### Summary: five candidates tested this round, none fixed the degradation
+
+| Candidate | Result |
+|---|---|
+| CPU saturation | Ruled out — max 23-25% of 24 cores |
+| Concurrency vs. LLM-ratio (raw dose-response) | Inconclusive on its own; superseded by the direct A/B test below |
+| LLM traffic present vs. absent (same concurrency) | **Confirmed causal** — 0/144 vs. 26/129 requests over 100ms |
+| Uvicorn `--backlog`/`--timeout-keep-alive` tuning | No reproducible improvement |
+| Uvicorn `--limit-concurrency` set too low | Confirmed severe trade-off (90% failure rate at limit=5) — not the fix, a new risk to avoid |
+| AsyncOpenAI connection pool widening | Premise refuted (SDK already generous); no effect, as predicted |
+| 3x replicas behind a real load balancer | No reproducible improvement; confirmed cache-hit-rate cost |
+
+Two candidates are now ruled out from the previous round
+(`@log_activity`, the classifier hot path), five more from this round
+(CPU, connection-pool sizes on both the server and OpenAI-client side,
+backlog/keep-alive tuning, and — the biggest structural lever available —
+horizontal scaling itself). The degradation is real, reproducible, and
+now substantially narrowed: it is not caused by anything this codebase's
+own request-handling code does, and it does not respond to adding more
+independent instances of that code. The leading remaining hypothesis is
+infrastructure shared across all instances alike — most concretely, the
+Docker Desktop WSL2 networking layer sitting between the test client and
+every container in this environment — which would also explain why
+scaling replicas (all still behind the same host-level Docker Desktop
+networking stack) didn't help. Confirming that specific layer needs a
+different test environment (bare-Linux Docker, or a loadtest client
+co-located inside the Docker network) than this investigation had
+available, and is recorded here as the concrete next step, not left
+unstated.
+
+### A real bug found along the way, unrelated to the p95 question: cancelling the resolving request could hang coalesced waiters forever
+
+Reviewing shutdown behavior for `parse_service.py`'s in-flight request
+coalescing (a graceful shutdown cancels whatever task is still resolving
+when the grace period elapses) surfaced a genuine gap, confirmed by direct
+reproduction before fixing: the code that settles the shared
+`asyncio.Future` on failure caught `except Exception`, but
+`asyncio.CancelledError` is a `BaseException`, not an `Exception`, since
+Python 3.8 — so a cancelled resolver never settled its future at all.
+Any concurrent request coalescing onto that same future (`await
+existing_future`) would then hang **indefinitely**, since nothing else
+was ever going to resolve it. Reproduced directly with a controlled
+test before fixing (see `tests/test_parse_service.py`'s
+`test_cancelling_the_resolving_request_does_not_hang_coalesced_waiters`):
+confirmed the hang, then confirmed the fix (catching `BaseException`,
+wrapping a bare `CancelledError` as a plain `RuntimeError` so it doesn't
+bleed an unrelated cancellation into the waiter's own task) resolves it in
+microseconds instead. See `docs/conventions/repositories.md`'s coalescing
+section and `app/services/parse_service.py` for the fixed code.

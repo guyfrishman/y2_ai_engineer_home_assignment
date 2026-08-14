@@ -115,3 +115,38 @@ async def test_concurrent_identical_queries_all_see_the_same_failure(monkeypatch
     assert len(results) == 5
     assert all(isinstance(result, RuntimeError) for result in results)
     assert all("simulated failure during resolution" in str(result) for result in results)
+
+
+async def test_cancelling_the_resolving_request_does_not_hang_coalesced_waiters(monkeypatch):
+    import asyncio
+
+    # Simulates a graceful shutdown: uvicorn cancels the owning request's
+    # task once the grace period elapses while it's still mid-resolution.
+    resolving_started = asyncio.Event()
+    block_forever = asyncio.Event()
+
+    async def hanging_resolve(canonical_query, cache_key):
+        resolving_started.set()
+        await block_forever.wait()  # never set -- this coroutine only ever ends via cancellation
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(parse_service, "_resolve", hanging_resolve)
+
+    query = "דירת 3 חדרים בירושלים עד מליון שח"
+    owner_task = asyncio.create_task(parse_service.parse_query(query))
+    await asyncio.wait_for(resolving_started.wait(), timeout=1.0)
+
+    waiter_task = asyncio.create_task(parse_service.parse_query(query))
+    await asyncio.sleep(0.05)  # let the waiter reach `await existing_future` before cancelling the owner
+
+    owner_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await owner_task
+
+    # The real assertion: cancelling the owner must not leave the
+    # coalesced waiter hanging forever -- it should fail promptly with a
+    # normal, catchable exception instead of a bare CancelledError bleeding
+    # into an unrelated task. A 1s bound here is a test-safety net, not the
+    # expected latency -- a fixed implementation settles this in microseconds.
+    with pytest.raises(RuntimeError, match="in-flight resolution did not complete"):
+        await asyncio.wait_for(waiter_task, timeout=1.0)

@@ -13,6 +13,7 @@ means threading it would add overhead with no real parallelism); only this
 network-bound edge needs asyncio.
 """
 
+import httpx2
 from openai import AsyncOpenAI
 
 from app.config import settings
@@ -30,6 +31,20 @@ Message = dict[str, str]
 # and short instead.
 OPENAI_REQUEST_TIMEOUT_SECONDS = 5.0
 OPENAI_MAX_RETRIES = 0
+
+# Checked directly, not assumed (see
+# docs/infrastructure/latency-investigation.md's connection-pool section):
+# openai-python 3.x already configures a far more generous pool than bare
+# httpx's own defaults would suggest — openai._constants.DEFAULT_CONNECTION_LIMITS
+# is max_connections=1000, max_keepalive_connections=100 on its vendored
+# httpx2 transport, not httpx's commonly-cited 100/20. This service's own
+# concurrency never approaches even the SDK's default, so this doubling is
+# not expected to change measured latency — kept explicit anyway (as an
+# httpx2.Limits, matching the SDK's own transport, not bare httpx.Limits,
+# which AsyncOpenAI's http_client parameter would reject) so the ceiling is
+# a documented, intentional value here rather than an SDK internal a future
+# reader has to go looking for.
+_OPENAI_CONNECTION_LIMITS = httpx2.Limits(max_connections=2000, max_keepalive_connections=200)
 
 
 class OpenAIUnavailableError(RuntimeError):
@@ -49,6 +64,7 @@ class OpenAIRepository:
                 api_key=settings.openai_api_key,
                 timeout=OPENAI_REQUEST_TIMEOUT_SECONDS,
                 max_retries=OPENAI_MAX_RETRIES,
+                http_client=httpx2.AsyncClient(limits=_OPENAI_CONNECTION_LIMITS),
             )
         return cls._client
 

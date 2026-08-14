@@ -83,8 +83,13 @@ docker compose up --build
   worker exposes only a partial view of `/metrics` (whichever counter
   increments happened to land on that worker), producing misleading
   numbers rather than an error. Scale horizontally via container replicas
-  behind a load balancer, not via `--workers`. The `Dockerfile`'s `CMD` is
-  deliberately plain `uvicorn main:app` with no worker count.
+  behind a load balancer, not via `--workers` — validated end-to-end (3
+  replicas behind nginx, temporary validation infrastructure, since torn
+  down) in `docs/infrastructure/observability.md`'s multi-replica section
+  and `docs/infrastructure/latency-investigation.md`. The `Dockerfile`'s
+  `CMD` has no worker count and adds only connection-handling flags
+  (`--backlog`, `--limit-concurrency`, `--timeout-keep-alive` — see that
+  doc for what they did and didn't change).
 - **`asyncio.to_thread`/thread pools were deliberately *not* used for the
   rule/cache path.** That work is CPU-bound Python (regex scanning, Pydantic
   validation) — the GIL means threading it adds scheduling overhead with no
@@ -134,25 +139,24 @@ docker compose up --build
   flight) model-path p95 climbed further — consistent with
   queuing/throttling under burst concurrent traffic from one API key — and
   the cache/rules path's own p95 also degraded in the same runs (200-700ms
-  across several, despite doing no network I/O). Two candidate causes were
-  tested directly, not assumed. `@log_activity` (a `json.dumps` + recursive
-  truncation on every function call) was removed entirely as part of the
-  logging rewrite (`docs/conventions/logging.md`), and the same loadtest
-  re-run at the same concurrency showed **no improvement** — cache/rules
-  p95 was still 200-700ms. `classifier_service._scan_term_occurrences`
-  (O(number of taxonomy terms) — 241 regex patterns checked per query) was
-  profiled in isolation: ~0.11ms per call, ~0.14ms for the full
-  sanitize→normalize→classify→extract pipeline; even 20 requests
-  serializing entirely behind each other on the GIL is only ~2.8ms of
-  aggregate queueing — three orders of magnitude short of what's observed,
-  so no rewrite was made. Across three loadtest runs total, cache-only
-  traffic (no concurrent LLM calls) was consistently fast (~50ms); any run
-  with real concurrent LLM traffic showed the degradation regardless of
-  either candidate. That rules out both as the cause and points toward
-  infra-level contention (client connection pooling, or Docker Desktop's
-  networking layer under sustained external call volume) instead — not
-  isolated further than that, but two "it's this code" explanations are
-  now tested and rejected, not live ones.
+  across several, despite doing no network I/O). Seven candidate causes
+  have now been tested directly, not assumed, across two investigation
+  rounds, and all seven are ruled out: `@log_activity`, the classifier's
+  taxonomy-term scan, raw CPU/memory saturation, uvicorn's
+  backlog/keep-alive tuning, the AsyncOpenAI client's connection-pool size,
+  and — the biggest lever tried — running 3x the capacity behind a real
+  load balancer. None moved cache/rules p95 outside its existing
+  run-to-run noise band. What *is* confirmed causally (a direct A/B test:
+  0/144 vs. 26/129 requests over 100ms at the same concurrency) is that the
+  stall only appears when concurrent LLM-path traffic is present, and a
+  bimodal latency distribution (most requests fast, a tight cluster stuck
+  at a near-identical delay) points at a shared blocking resource, not a
+  per-request cost. Full methodology and every number:
+  `docs/infrastructure/latency-investigation.md`'s "Docker/infra
+  investigation" section. Leading remaining hypothesis, not yet isolated:
+  infrastructure shared across every instance alike — most concretely, the
+  Docker Desktop WSL2 network translation layer between this project's test
+  client and the containers in this development environment.
 
   The credible paths to closing the core gap, not yet implemented: (1)
   scope the `יד_שנייה` schema to just the rule path's candidate
