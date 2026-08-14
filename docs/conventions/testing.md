@@ -7,7 +7,7 @@ cd y2_ai_search_api
 uv run pytest
 ```
 
-99 tests, `~2s`, zero network calls.
+103 tests, `~1.6s`, zero network calls.
 
 ## What's covered (`y2_ai_search_api/tests/`)
 

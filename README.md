@@ -83,7 +83,7 @@ curl http://localhost:8000/metrics
 ```
 
 ```bash
-cd y2_ai_search_api && uv run pytest                                              # 99 tests, no network, ~1.5s
+cd y2_ai_search_api && uv run pytest                                              # 103 tests, no network, ~1.5s
 cd y2_ai_search_api && uv run python ../scripts/loadtest.py --requests 200 --concurrency 20
 ```
 

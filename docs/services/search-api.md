@@ -47,7 +47,7 @@ y2_ai_search_api/
 │   └── parse_service.py               # orchestrates the full pipeline
 ├── routers/
 │   └── api.py, search.py, ping.py
-└── tests/                     # 99 tests, no network — see docs/conventions/testing.md
+└── tests/                     # 103 tests, no network — see docs/conventions/testing.md
 ```
 
 Follows the repo conventions — [routers](../conventions/routers.md),
