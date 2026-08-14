@@ -374,12 +374,46 @@ would trade "boring and obvious" for a real engineering cost (correctness
 risk around the existing longest-match-wins and span-consumption
 semantics) to save microseconds nothing is waiting on.
 
-Two candidates are now ruled out (`@log_activity`, the classifier hot
-path); the actual mechanism behind the cache/rules degradation under
-concurrent LLM load remains an open question, still most likely
-infra-level contention (client connection pooling, or Docker Desktop's
-networking layer under sustained external call volume) rather than
-anything in this codebase's own CPU-bound work.
+## Third ruled-out candidate: llm_confidence_service's logprob computation
+
+`compute_logprob_confidence` — token-stream reconstruction, the
+character-offset walk, `json.JSONDecoder.raw_decode` value-span finding,
+and the geometric-mean logprob math — runs synchronously on the event
+loop after every successful LLM tier call, exactly like the classifier's
+hot path runs on every rules-path request. Unlike the classifier and
+`@log_activity`, it hadn't been profiled: it's specifically gated on LLM
+traffic (never runs on a pure cache/rules request), which makes it a
+structurally different kind of candidate for the still-partially-open
+cache/rules degradation (Docker/infra investigation, below) — worth
+checking on its own merits, not assumed negligible by analogy to the
+other two.
+
+**Profiled with real captured completions, not synthetic ones.** Six
+real Tier 1 completions (the golden low-confidence query set, real API
+calls, `logprobs=True`) — 155-207 tokens each, 20-28 present fields each
+(these are deliberately low rule-confidence queries, so schema scoping
+excluded few fields, giving each call close to the largest present-field
+list this function ever has to search against — closer to a worst case
+than a typical one). 200 isolated iterations per completion (1,200 calls
+total), same methodology as the classifier hot-path profiling:
+
+| Measurement | Mean | p95 | Max |
+|---|---|---|---|
+| `compute_logprob_confidence` alone | **0.228ms** | **0.380ms** | 1.047ms |
+
+**Conclusion: not the cause.** Sub-millisecond on every measure, same
+order of magnitude as the classifier's own hot path (0.107-0.14ms) and
+roughly three orders of magnitude below the 200-700ms degradation this
+candidate was checked against. No optimization made — there's nothing
+here worth trading simplicity for.
+
+Three candidates are now ruled out (`@log_activity`, the classifier hot
+path, and `llm_confidence_service`'s logprob computation); the actual
+mechanism behind the cache/rules degradation under concurrent LLM load
+remains an open question — see the "Primary cause identified; one
+compounding factor confirmed open" section below for how far that's been
+narrowed since this page was first written, and why it isn't fully
+identified yet.
 
 ## Docker/infra investigation: five more candidates tested, one real bug found elsewhere
 
@@ -600,8 +634,9 @@ both worth a dedicated follow-up.
 | AsyncOpenAI connection pool widening | Premise refuted (SDK already generous); no effect, as predicted |
 | 3x replicas behind a real load balancer | No reproducible improvement; confirmed cache-hit-rate cost |
 
-Two candidates are now ruled out from the previous round
-(`@log_activity`, the classifier hot path), five more from this round
+Three candidates are now ruled out from the previous round
+(`@log_activity`, the classifier hot path, `llm_confidence_service`'s
+logprob computation), five more from this round
 (CPU, connection-pool sizes on both the server and OpenAI-client side,
 backlog/keep-alive tuning, and — the biggest structural lever available —
 horizontal scaling itself). The degradation is real, reproducible, and

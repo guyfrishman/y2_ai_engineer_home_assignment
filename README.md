@@ -92,10 +92,11 @@ cd y2_ai_search_api && uv run python ../scripts/loadtest.py --requests 200 --con
 Cache/rules p95 passes (≤150ms) at steady state, but **a fresh, cold
 client hitting a freshly-started instance can see 200-700ms on its first
 burst of concurrent traffic** — narrowed, with the root mechanism now
-honestly reported as still open, not resolved. Seven infra/networking
-candidates were ruled out across two investigation rounds
-(`@log_activity`, the classifier's taxonomy scan, CPU/memory saturation,
-uvicorn tuning, connection-pool sizing, 3x replica capacity). A minimal
+honestly reported as still open, not resolved. Eight candidates were
+ruled out across two investigation rounds (`@log_activity`, the
+classifier's taxonomy scan, the LLM-confidence logprob computation —
+profiled with real captured completions, sub-millisecond — CPU/memory
+saturation, uvicorn tuning, connection-pool sizing, 3x replica capacity). A minimal
 zero-app-code control test (bare FastAPI, one instant route, one
 `asyncio.sleep` route), run natively on Windows, reproduced a matching
 pattern and was initially reported as the resolved cause — a mistake

@@ -110,8 +110,8 @@ burst concurrent traffic from one API key), and cache/rules p95 also
 degrading to 200-700ms in the same runs, despite that code path doing no
 network I/O of its own.
 
-**Seven candidate causes have now been tested directly across two
-investigation rounds, and all seven are ruled out.** Round one:
+**Eight candidate causes have now been tested directly across two
+investigation rounds, and all eight are ruled out.** Round one:
 `@log_activity` (a per-function decorator emitting a `json.dumps` +
 recursive truncation on every call) was removed entirely (see
 `conventions/logging.md`) and re-tested — cache/rules p95 unchanged
@@ -119,7 +119,13 @@ recursive truncation on every call) was removed entirely (see
 (`classifier_service._scan_term_occurrences`, 241 compiled regex patterns
 per query) was profiled directly: ~0.11ms per call, ~0.14ms for the full
 pipeline, ~2.8ms worst-case aggregate at 20 concurrent requests — three
-orders of magnitude short of what's observed. Round two (full methodology
+orders of magnitude short of what's observed. A third candidate specific
+to LLM traffic — `llm_confidence_service.compute_logprob_confidence`,
+which only runs after a successful LLM tier call, unlike the other two —
+was profiled with real captured completions (not synthetic): mean
+0.228ms, p95 0.380ms across 1,200 real-data iterations, same
+sub-millisecond order of magnitude as the other two, ruled out on the
+same grounds. Round two (full methodology
 and every number: `infrastructure/latency-investigation.md`'s
 "Docker/infra investigation" section) tested infra/networking candidates
 specifically: raw CPU/memory saturation (ruled out — max 23-25% of 24

@@ -138,11 +138,13 @@ docker compose up --build
   flight) model-path p95 climbed further — consistent with
   queuing/throttling under burst concurrent traffic from one API key — and
   the cache/rules path's own p95 also appeared to degrade in the same runs
-  (200-700ms across several, despite doing no network I/O). Seven
+  (200-700ms across several, despite doing no network I/O). Eight
   candidate causes were tested directly across two investigation rounds
-  and all seven ruled out (`@log_activity`, the classifier's taxonomy-term
-  scan, raw CPU/memory saturation, uvicorn tuning, connection-pool sizing,
-  3x replica capacity). A minimal zero-app-code control test (a bare
+  and all eight ruled out (`@log_activity`, the classifier's taxonomy-term
+  scan, `llm_confidence_service`'s logprob computation — profiled with
+  real captured completions at 0.228ms mean, 0.380ms p95 — raw CPU/memory
+  saturation, uvicorn tuning, connection-pool sizing, 3x replica
+  capacity). A minimal zero-app-code control test (a bare
   FastAPI app, one instant route, one `asyncio.sleep` route), run
   **natively on Windows**, reproduced a matching bimodal pattern — the
   first ~20 concurrently-submitted requests paying a one-time cost, later
