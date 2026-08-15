@@ -3,26 +3,13 @@
 A FastAPI service that converts a Hebrew free-text marketplace query
 (`"דירת 3 חדרים בירושלים עד מליון שח"`) into structured, taxonomy-validated
 search parameters for one of three Yad2 verticals (נדל״ן / רכב / יד_שנייה).
-A rule/dictionary classifier and extractor handle the majority of traffic
-at zero marginal cost; a two-tier OpenAI cascade — cheap model first,
-escalating only on api_error (a validation failure degrades immediately,
-no escalation), degrading gracefully rather than failing if that's
-unavailable — covers what rules genuinely can't resolve,
-including a dedicated classify-only call for queries with zero taxonomy
-signal at all. Every field either path can emit comes straight out of
-`data/taxonomy.json`, dynamically, so no code path can invent a field
-outside the taxonomy.
 
-`category` is `Vertical | None`: a well-formed query that doesn't belong
-to any of the three verticals — or reads as an instruction rather than a
-search — returns `category: null`, not a forced guess. A deliberate
-contract change from a strict 3-value enum: forcing a wrong category on
-an out-of-domain or injection query is worse than an honest null.
+
 
 ## Pipeline
 
 ```
-POST /parse  { "q": "<Hebrew free text>" }
+POST /parse  { "q": "<User input: Hebrew free text>" }
    │
    ▼
 sanitize (emoji/control chars/length)
@@ -65,14 +52,19 @@ rule/dictionary classify + extract
                 degrade to rule path's own result, confidence=0.15, notes flag
 ```
 
-Confidence is measured, not asserted, on every path — see
-[`docs/DESIGN.md`](docs/DESIGN.md) for the full formulas, the zero-signal
-classification fix, and known disclosed limitations. One disclosed
-limitation worth stating plainly: `data/taxonomy.json`'s `יד_שנייה` sectors
-have no kitchen-appliance category at all (e.g. a fridge query, `מקרר`) —
-a genuine gap in the provided taxonomy data, not a bug in this service; the
-zero-signal gate above still degrades it gracefully (an honest `null` or a
-disclosed low-confidence guess), never a silent, confident wrong answer.
+## Confidence 
+produced differently depending on which path answers the
+query: 
+the rule engine scores it deterministically via a simple formula.
+Matched taxonomy-term coverage of the query. 
+The LLM path is scored from the model's own token-level certainty,
+cross-checked against a semantic-similarity comparison. 
+A technical failure and an explicit "none of these" each get a fixed 
+score — a technical failure gets a fixed low score, "none of these" gets a fixed score of zero.
+
+Without ground truth to calibrate against, statistical computation is
+limited in its usefulness — it serves as a first iteration example
+rather than a final product.
 
 ## Quickstart
 
@@ -84,6 +76,9 @@ cp .env.example .env
 cd ..
 docker compose up --build
 ```
+open api documentation
+http://localhost:8000/docs
+
 
 ```bash
 curl -X POST http://localhost:8000/parse \
