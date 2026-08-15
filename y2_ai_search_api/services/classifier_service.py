@@ -31,6 +31,7 @@ class TermOccurrence:
     matched_text: str
     vertical: Vertical
     field_name: str
+    is_general_attribute: bool
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,11 @@ class ClassificationResult:
     vertical: Vertical
     confidence: float
     term_occurrences: list[TermOccurrence]
+    # True when >=2 verticals share the top score. `vertical` is then just
+    # whichever is declared first in the Vertical enum -- max()'s tie-break,
+    # not a real pick -- same as the confidence==0.0 case, just with a
+    # nonzero coverage_ratio. Callers should treat both the same way.
+    is_tied: bool
 
 
 # Precompiled once at import: longest terms first, so a multi-word term like
@@ -67,13 +73,28 @@ def _scan_term_occurrences(canonical_query: str) -> list[TermOccurrence]:
         if not match:
             continue
         for term_match in taxonomy_repository.term_index[term]:
-            occurrences.append(TermOccurrence(term, term_match.vertical, term_match.field_name))
+            occurrences.append(
+                TermOccurrence(term, term_match.vertical, term_match.field_name, term_match.is_general_attribute)
+            )
         working_text = working_text[: match.start()] + ("\0" * len(term)) + working_text[match.end() :]
     return occurrences
 
 
 def _matched_word_count(occurrences: list[TermOccurrence], vertical: Vertical) -> int:
-    return sum(len(occurrence.matched_text.split()) for occurrence in occurrences if occurrence.vertical == vertical)
+    """Counts only *identifying* term matches (property/vehicle type,
+    brand/model, city, sector/subcategory) toward classification score and
+    confidence — a general_attributes value ("מלא", "חשמלי", "גז", "חדש", ...)
+    describes a property of an item already identified as belonging to a
+    vertical, not signal for WHICH vertical it belongs to; on its own it's
+    indistinguishable from the same word used in an unrelated, everyday
+    sense. Extraction is unaffected: it reads from the unfiltered
+    `term_occurrences`/`winning_occurrences`, so these values still
+    populate their fields once a vertical is otherwise established."""
+    return sum(
+        len(occurrence.matched_text.split())
+        for occurrence in occurrences
+        if occurrence.vertical == vertical and not occurrence.is_general_attribute
+    )
 
 
 def _cue_word_count(words: list[str], vertical: Vertical) -> int:
@@ -88,14 +109,30 @@ def _vertical_scores(occurrences: list[TermOccurrence], words: list[str]) -> dic
     }
 
 
-def _margin_factor(scores: dict[Vertical, int]) -> float:
-    ranked = sorted(scores.values(), reverse=True)
+def _ranked_scores(scores: dict[Vertical, int]) -> list[int]:
+    return sorted(scores.values(), reverse=True)
+
+
+def _margin_factor(ranked: list[int]) -> float:
     top_score = ranked[0]
     if top_score == 0:
         return MARGIN_FACTOR_MIN
     second_score = ranked[1] if len(ranked) > 1 else 0
     margin = (top_score - second_score) / top_score
     return MARGIN_FACTOR_MIN + (MARGIN_FACTOR_MAX - MARGIN_FACTOR_MIN) * margin
+
+
+def _is_tied(ranked: list[int]) -> bool:
+    """A genuine top-score tie between >=2 verticals: the same defaulting
+    problem as a 0-0-0 tie (max() picks whichever vertical is declared
+    first), just at a nonzero score. E.g. "שולחן אבירים אלון מלא..." scores
+    יד_שנייה=1 (שולחן, a real furniture-type match) and נדל״ן=1 (מלא, a real
+    but unrelated ריהוט/furnished-status value that happens to also mean
+    "solid" here) -- a coin flip that נדל״ן wins only because it's declared
+    first in the Vertical enum, not because either match is stronger."""
+    top_score = ranked[0]
+    second_score = ranked[1] if len(ranked) > 1 else 0
+    return top_score > 0 and top_score == second_score
 
 
 def classify_query(canonical_query: str) -> ClassificationResult:
@@ -114,6 +151,7 @@ def classify_query(canonical_query: str) -> ClassificationResult:
     occurrences = _scan_term_occurrences(canonical_query)
     scores = _vertical_scores(occurrences, words)
     winning_vertical = max(scores, key=lambda vertical: scores[vertical])
+    ranked = _ranked_scores(scores)
 
     non_stopword_words = [word for word in words if word not in HEBREW_STOPWORDS]
     winning_matched_word_count = _matched_word_count(occurrences, winning_vertical)
@@ -141,11 +179,12 @@ def classify_query(canonical_query: str) -> ClassificationResult:
     else:
         coverage_ratio = min(matched_signal_tokens, total_signal_tokens) / total_signal_tokens
 
-    confidence = coverage_ratio * _margin_factor(scores)
+    confidence = coverage_ratio * _margin_factor(ranked)
     winning_occurrences = [occurrence for occurrence in occurrences if occurrence.vertical == winning_vertical]
 
     return ClassificationResult(
         vertical=winning_vertical,
         confidence=round(min(max(confidence, 0.0), 1.0), 4),
         term_occurrences=winning_occurrences,
+        is_tied=_is_tied(ranked),
     )

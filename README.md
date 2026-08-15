@@ -41,7 +41,7 @@ rule/dictionary classify + extract
    ├─ 0 < confidence < 0.58 (partial signal, a real hint)
    │        │
    │        ▼
-   └─ confidence == 0.0 (zero signal) ─► classify-only LLM call
+   └─ confidence == 0.0, or a tied top score ─► classify-only LLM call
             │
             ├─ call fails ──────────► degrade to rule path's default, confidence=0.15
             ├─ explicit null ───────► category=null, confidence=0.0, cache write, return
@@ -67,7 +67,12 @@ rule/dictionary classify + extract
 
 Confidence is measured, not asserted, on every path — see
 [`docs/DESIGN.md`](docs/DESIGN.md) for the full formulas, the zero-signal
-classification fix, and known disclosed limitations.
+classification fix, and known disclosed limitations. One disclosed
+limitation worth stating plainly: `data/taxonomy.json`'s `יד_שנייה` sectors
+have no kitchen-appliance category at all (e.g. a fridge query, `מקרר`) —
+a genuine gap in the provided taxonomy data, not a bug in this service; the
+zero-signal gate above still degrades it gracefully (an honest `null` or a
+disclosed low-confidence guess), never a silent, confident wrong answer.
 
 ## Quickstart
 

@@ -55,10 +55,19 @@ def _split_into_words(text: str) -> list[str]:
 
 class TaxonomyTermMatch(NamedTuple):
     """One known taxonomy term and the vertical/field it belongs to — the unit
-    the classifier scores coverage with and the extractor fills fields from."""
+    the classifier scores coverage with and the extractor fills fields from.
+
+    is_general_attribute: True for a value sourced from a מאפיינים_כלליים
+    field (condition, color, fuel type, furnished status, ...) — a property
+    of an item that's already been identified, not identifying signal for
+    WHICH vertical it belongs to ("מלא" only means "fully furnished" once
+    you already know it's real estate; standalone it's just the word
+    "full"). False for a value that genuinely identifies a category
+    (property/vehicle type, brand, model, city, sector/subcategory)."""
 
     vertical: Vertical
     field_name: str
+    is_general_attribute: bool = False
 
 
 class TaxonomyRepository:
@@ -87,6 +96,18 @@ class TaxonomyRepository:
             Vertical.USED_GOODS: self.used_goods.get("מיפוי_מילות_שגיאה", {}),
         }
 
+        # Same mapping schema.taxonomy_models.build_used_goods_params_model
+        # uses for its cross-field סקטור/תת_קטגוריה validator — exposed here
+        # too so extractor_service can backfill סקטור deterministically the
+        # moment a תת_קטגוריה term matches, instead of leaving a field with
+        # only one valid answer for the LLM to guess (and risk failing that
+        # same cross-field check on).
+        self.used_goods_subcategory_to_sector: dict[str, str] = {
+            subcategory: sector
+            for sector, sector_data in self.used_goods.get("סקטורים", {}).items()
+            for subcategory in sector_data.get("תתי_קטגוריות", {})
+        }
+
         self.brand_models: dict[str, list[str]] = {
             brand: brand_data.get("דגמים", [])
             for brand, brand_data in self.vehicles.get("יצרנים", {}).items()
@@ -103,14 +124,14 @@ class TaxonomyRepository:
     def _build_term_index(self) -> dict[str, list[TaxonomyTermMatch]]:
         index: dict[str, list[TaxonomyTermMatch]] = {}
 
-        def add_term(term: str, vertical: Vertical, field_name: str) -> None:
+        def add_term(term: str, vertical: Vertical, field_name: str, is_general_attribute: bool = False) -> None:
             if not term:
                 return
             # The same value (e.g. "כמו חדש") legitimately recurs across
             # several used-goods subcategories that share a field name —
             # dedupe so it doesn't get over-weighted in coverage scoring.
             existing = index.setdefault(term, [])
-            match = TaxonomyTermMatch(vertical, field_name)
+            match = TaxonomyTermMatch(vertical, field_name, is_general_attribute)
             if match not in existing:
                 existing.append(match)
 
@@ -126,11 +147,11 @@ class TaxonomyRepository:
             add_term(transaction_type, Vertical.REAL_ESTATE, "מצבי_עסקה")
         general_attributes = self.real_estate.get("מאפיינים_כלליים", {})
         for city in general_attributes.get("עיר", {}).get("דוגמאות", []):
-            add_term(city, Vertical.REAL_ESTATE, "עיר")
+            add_term(city, Vertical.REAL_ESTATE, "עיר")  # identifying, not a generic descriptor
         for field_name, attribute_definition in general_attributes.items():
             if isinstance(attribute_definition, list):
                 for value in attribute_definition:
-                    add_term(value, Vertical.REAL_ESTATE, field_name)
+                    add_term(value, Vertical.REAL_ESTATE, field_name, is_general_attribute=True)
 
     def _index_vehicle_terms(self, add_term) -> None:
         for vehicle_type in self.vehicles.get("סוגי_רכב", []):
@@ -152,7 +173,7 @@ class TaxonomyRepository:
         for field_name, attribute_definition in general_attributes.items():
             if isinstance(attribute_definition, list):
                 for value in attribute_definition:
-                    add_term(value, Vertical.VEHICLES, field_name)
+                    add_term(value, Vertical.VEHICLES, field_name, is_general_attribute=True)
 
     def _index_used_goods_terms(self, add_term) -> None:
         for sector, sector_data in self.used_goods.get("סקטורים", {}).items():
@@ -168,7 +189,7 @@ class TaxonomyRepository:
         for field_name, attribute_definition in general_attributes.items():
             if isinstance(attribute_definition, list):
                 for value in attribute_definition:
-                    add_term(value, Vertical.USED_GOODS, field_name)
+                    add_term(value, Vertical.USED_GOODS, field_name, is_general_attribute=True)
 
     def _build_cue_words(self) -> dict[Vertical, frozenset[str]]:
         """Cue words — words that signal a vertical even though they're
@@ -180,14 +201,22 @@ class TaxonomyRepository:
         Rule B: each general-attribute field name, split into words, is a
             candidate for its vertical — a field name is often exactly the
             word a real query uses (e.g. "מס׳_חדרים" -> "חדרים").
-        Rule C: each multi-word taxonomy value (property/vehicle/sector/
-            subcategory names, and every general-attribute enum's values —
-            the same sources _index_*_terms already scans) is split into
-            words, each a candidate for that value's vertical. Brand/model/
-            trim names are deliberately excluded: proper nouns, not
-            conceptual category vocabulary, and splitting one (e.g.
-            "Model 3" -> "3") would introduce noise Rule D can't tell apart
-            from a real word.
+        Rule C: each multi-word *identifying* taxonomy value (property/
+            vehicle type, sector/subcategory names) is split into words,
+            each a candidate for that value's vertical. Brand/model/trim
+            names are deliberately excluded: proper nouns, not conceptual
+            category vocabulary, and splitting one (e.g. "Model 3" -> "3")
+            would introduce noise Rule D can't tell apart from a real word.
+            General-attribute enum values (condition, color, fuel type, ...)
+            are deliberately NOT a source here, for the same reason
+            add_term's is_general_attribute flag excludes them from
+            classification score at the whole-term level: a general
+            attribute describes a property of an item already identified,
+            not identifying signal for which vertical it belongs to — e.g.
+            "היברידי נטען" splitting into a "נטען" cue word would let a
+            general_attributes value smuggle its way back into scoring
+            through the cue-word path even after being excluded from the
+            term-match path.
         Rule D: a candidate is dropped if it's a stopword, shorter than
             MIN_CUE_WORD_LENGTH, a candidate for more than one vertical
             (cross-vertical ambiguous — e.g. "פרטי", a value under both
@@ -216,26 +245,14 @@ class TaxonomyRepository:
             add_words(property_type, Vertical.REAL_ESTATE)  # Rule C
         for transaction_type in self.real_estate.get("מצבי_עסקה", []):
             add_words(transaction_type, Vertical.REAL_ESTATE)
-        for attribute_definition in self.real_estate.get("מאפיינים_כלליים", {}).values():
-            if isinstance(attribute_definition, list):
-                for value in attribute_definition:
-                    add_words(value, Vertical.REAL_ESTATE)
 
         for vehicle_type in self.vehicles.get("סוגי_רכב", []):
             add_words(vehicle_type, Vertical.VEHICLES)
-        for attribute_definition in self.vehicles.get("מאפיינים_כלליים", {}).values():
-            if isinstance(attribute_definition, list):
-                for value in attribute_definition:
-                    add_words(value, Vertical.VEHICLES)
 
         for sector, sector_data in self.used_goods.get("סקטורים", {}).items():
             add_words(sector, Vertical.USED_GOODS)
             for subcategory in sector_data.get("תתי_קטגוריות", {}):
                 add_words(subcategory, Vertical.USED_GOODS)
-        for attribute_definition in self.used_goods.get("מאפיינים_כלליים", {}).values():
-            if isinstance(attribute_definition, list):
-                for value in attribute_definition:
-                    add_words(value, Vertical.USED_GOODS)
 
         result: dict[Vertical, frozenset[str]] = {}
         for vertical in Vertical:

@@ -12,13 +12,15 @@ deterministic, and fast; they handle the common case (a clear brand/city/
 property-type match) at zero marginal cost. A model call only happens when
 the rule path's confidence is below `confidence_threshold` (0.58):
 
-- **Zero signal** (`confidence == 0.0` exactly — no taxonomy-term or
-  cue-word match for *any* vertical): a dedicated, single-field
-  classify-only call (`services.llm_fallback_service.run_category_classification`)
-  picks the vertical first, then the normal extraction cascade runs scoped
-  to that vertical. Without this step, the rule path's `max()` tie-break
-  silently returns `Vertical`'s first-declared member — this service
-  shipped that bug once; see "The zero-signal bug" below.
+- **Zero signal or a genuine top-score tie** (`confidence == 0.0`, or
+  `classification.is_tied` — two or more verticals scored equally): a
+  dedicated, single-field classify-only call
+  (`services.llm_fallback_service.run_category_classification`) picks the
+  vertical first, then the normal extraction cascade runs scoped to that
+  vertical. Without this step, the rule path's `max()` tie-break silently
+  returns `Vertical`'s first-declared member — this service shipped that
+  bug twice, once at zero score and once at a tied nonzero score; see "The
+  zero-signal bug" below.
 - **Partial signal** (`0 < confidence < threshold`): the rule path's own
   vertical is a real, if uncertain, hint — it's handed straight into the
   ordinary two-tier extraction cascade, same as always.
@@ -100,6 +102,178 @@ recur across many *different* queries resolving to the same vertical, and
 grow the taxonomy's own synonym coverage from that evidence, instead of a
 developer guessing synonyms up front.
 
+### The same bug at nonzero confidence (tied scores)
+
+Live testing surfaced a second instance of the same `max()`-tie-break flaw,
+producing a *nonzero* confidence that skipped the zero-signal gate
+entirely: `"שולחן אבירים אלון מלא ..."` (a table) scored a 1-1 tie —
+`"שולחן"` correctly matches `יד_שנייה`'s furniture-type field, `"מלא"`
+(from "אלון מלא", solid oak) matched `נדל״ן`'s `ריהוט` (furnished-status)
+value, unrelated in meaning here. `"טאבון גז ..."` (a gas oven) tied the
+same way via a normalizer fuzzy-correction misfire (below) plus `"גז"`
+matching vehicles' `סוג_דלק`. Both ties resolved to `Vertical.REAL_ESTATE`
+(declared first) at a small but nonzero confidence — below
+`confidence_threshold` but *not* `== 0.0`, so the zero-signal-only gate
+didn't catch it and passed the tie-broken vertical into extraction as a
+trusted hint.
+
+The fix has two layers, and both landed this pass:
+
+1. **The tie-break itself.** `classify_query` exposes `is_tied` (`>= 2`
+   verticals sharing the top score) and `_run_llm_branch` routes a tie
+   through the same classify-only call as `confidence == 0.0`, rather than
+   trusting either side of a coin flip. This is real, general protection —
+   it's what still catches `"מסחרי"` (below), a genuine taxonomy-inherent
+   tie with no deeper root cause to fix.
+2. **The two specific matches that produced these two ties turned out to
+   be fixable at the source**, once traced down (see the next two
+   subsections): `"טאבון"` was a normalizer fuzzy-match false correction,
+   and `"מלא"`/`"גז"` were `general_attributes` values that shouldn't have
+   counted toward classification score at all. With both fixed, neither
+   query even reaches a tie anymore — `"שולחן ..."` now scores `יד_שנייה`
+   outright (`"מלא"` no longer contributes to `נדל״ן` at all), and
+   `"טאבון ..."` now reaches the clean `confidence == 0.0` gate directly
+   (`"טאבון"` isn't corrupted into `"טאבו"` anymore, and `"גז"` no longer
+   counts). Layer 1 (`is_tied`) is what still catches this class of bug
+   for a taxonomy-inherent case like `"מסחרי"`, where there's no deeper
+   fix available — but for `"שולחן"`/`"טאבון"` specifically, the real
+   root causes turned out to be one level deeper than the tie itself.
+
+`test_furniture_material_word_no_longer_competes_with_a_real_furniture_match`
+/ `test_typo_corrected_word_no_longer_ties_reaches_zero_signal_instead`
+(`tests/test_classifier_service.py`) lock in the final, resolved behavior;
+`test_furniture_query_resolves_directly_to_used_goods_no_classify_call_needed`
+/ `test_typo_corrected_query_reaches_zero_signal_gate_not_forced_to_real_estate`
+(`tests/test_zero_signal_classification.py`) lock in the full pipeline.
+`test_vehicle_type_words_shared_with_other_verticals_are_a_real_tie` keeps
+covering the genuinely-still-tied `"מסחרי"` case, proving layer 1 alone is
+still load-bearing for cases layer 2 can't reach.
+
+### Normalizer fuzzy-match false corrections
+
+`normalizer_service.correct_word` fuzzy-matches an unrecognized word
+against every known taxonomy term (`rapidfuzz.fuzz.ratio`,
+`FUZZY_MATCH_MIN_SCORE`). At the original cutoff (85), two real,
+semantically unrelated words were being silently corrupted into taxonomy
+terms that merely *look* similar: `"טאבון"` (tabun oven) → `"טאבו"`
+(land-registry status) and `"מיאטה"` (Miata, a car model) → `"מיטה"`
+(bed) — both score exactly 88.89. Raising the cutoff to 90 clears both
+false positives while leaving every genuine correction already covered by
+tests unaffected (the one real fuzzy-match test,
+`"למכירה"` → `"מכירה"`, scores 90.9, still corrects — a separate,
+already-disclosed quirk, not this bug). The audit also caught a third,
+previously-unnoticed instance the same way: `"שרון"` (Sharon, a region)
+was corrupted to `"ארון"` (closet) via the prefix-stripping fallback
+(`"ש"` read as the construct-state prefix, the remainder `"רון"` fuzzy-
+matching `"ארון"` at 85.71) — also cleared by the same threshold raise,
+caught by `tests/test_taxonomy_generated_classification.py`'s systematic
+audit (below) rather than found by hand. Regression tests:
+`test_normalizer_service.py`'s corrected-word tests plus
+`test_typo_corrected_word_no_longer_ties_reaches_zero_signal_instead`.
+
+A flat score cutoff is a blunt instrument — a stricter edit-distance rule
+or a minimum-length guard were considered, but the false positives and the
+one legitimate fuzzy case are cleanly separable by score alone (88.89 vs.
+90.9), so a more complex mechanism wasn't justified by the evidence.
+
+### `general_attributes` values don't count toward classification score
+
+The deeper root cause behind `"מלא"`/`"גז"`/`"חשמלי"` misdirecting
+classification: each is a real, correctly-indexed taxonomy value — but
+each is a `מאפיינים_כלליים` (general-attribute) value, describing a
+*property* of an item already identified as belonging to a vertical
+(furnished status, fuel type, condition, color, ...), not identifying
+signal for *which* vertical it belongs to. `"מלא"` only means "fully
+furnished" once you already know it's real estate; standalone, in "אלון
+מלא" (solid oak), it's just the adjective "full." The taxonomy already
+draws this line structurally (`מאפיינים_כלליים` vs. the
+identifying fields — property/vehicle type, brand, model, city,
+sector/subcategory) — the fix is mechanical, not a hand-picked word list:
+`TaxonomyTermMatch.is_general_attribute` (`repositories/taxonomy_repository.py`)
+marks every value sourced from a `מאפיינים_כלליים` field, and
+`classifier_service._matched_word_count` excludes those matches from both
+`_vertical_scores` (which vertical wins, and whether it's a tie) and the
+confidence formula's `coverage_ratio`. The same exclusion extends to
+cue-word derivation (`_build_cue_words`'s Rule C no longer decomposes
+`מאפיינים_כלליים` values into candidate cue words) — a multi-word general
+attribute like `"היברידי נטען"` (plug-in hybrid) would otherwise leak a
+word like `"נטען"` back into scoring as a cue word even after its own
+whole-term match was excluded.
+
+Extraction is unaffected: `term_occurrences` stays unfiltered, so a
+general-attribute value still populates its field once a vertical is
+otherwise established (a real "fully furnished" real-estate query still
+gets `ריהוט: מלא`) — only the *classification* score changes, per the
+principle "should still populate the field once a vertical is otherwise
+established, but should not by itself count toward classification
+confidence."
+
+Not every `מאפיינים_כלליים` value is exclusively generic: `"פרטי"` is
+*also* a real vehicles `סוגי_רכב` value (private-car body type is genuine
+identifying signal, not just the generic ownership descriptor), and
+used-goods' own `מצב` values (`"חדש"`, `"משומש"`, ...) double as real
+per-subcategory condition terms — these legitimately still score, since
+excluding them would mean testing a broader rule than the one actually
+implemented.
+
+**Systematically verified, not just for the two reported words**:
+`tests/test_taxonomy_generated_classification.py` walks every
+`(term, vertical)` pair from the taxonomy where *every* match under that
+vertical is general-attribute-sourced, and asserts none of them
+contributes to that vertical's score alone (117 pairs, at time of
+writing) — the mechanism the two live-reported words happened to surface,
+proven to hold taxonomy-wide, not patched around case by case.
+
+**Real cost, measured and accepted, not hidden**: this makes some
+existing rule-path examples less confident than before, because a color
+or transmission-type word no longer counts as "explained." Two of the
+eight worked examples in `docs/examples.md` now fall below
+`confidence_threshold` and resolve via the LLM fallback instead of the
+rule path alone (still the *correct* category and params, just a
+different, costlier path) — see `docs/examples.md` for the exact before/
+after numbers. The assignment brief only specifies expected output
+(category + params), not which internal path produces it, so this is a
+disclosed cost-model shift, not a correctness regression.
+
+### Cross-source double-claims and deterministic sector backfill
+
+Two smaller extraction findings from the same live-testing pass:
+
+- **A rule-claimed number could be independently reinvented by the LLM as
+  a different field.** `"...95000 ש״ח"` (no other number in the query):
+  the rule path correctly claims it as `מחיר`, and `מחיר` is excluded from
+  what the LLM extraction call is even asked for
+  (`_scoped_strict_json_schema`) — but the LLM still *sees* the raw query
+  text with `"95000"` still in it, and, asked to fill `ק״מ` among other
+  fields, could independently attribute the same number to mileage, live-
+  observed on this exact query. The rule extractor's own span-consumption
+  (blanking a matched number so a later rule-path field can't re-claim it)
+  never extended past the rule extractor's own boundary — the LLM call was
+  never told a number was already spoken for.
+  `llm_fallback_service._mask_claimed_numbers` closes the gap: every
+  numeric value (scalar or range bound) already in `rule_path_params` is
+  blanked out of the text before it's shown to the extraction call, so
+  there's no digit sequence left for the model to reinterpret. The
+  embedding cross-check still uses the original, unmasked query — masking
+  is only for what the extraction prompt sees.
+- **A matched subcategory backfills its sector deterministically.** A
+  `תת_קטגוריה` match (e.g. `"אופניים"`, bicycles) has exactly one valid
+  `סקטור` — the same mapping `schema.taxonomy_models`'s cross-field
+  validator already uses to reject a mismatched pair
+  (`used_goods_subcategory_to_sector`, now also exposed on
+  `taxonomy_repository`). `extractor_service.extract_used_goods_params`
+  now fills `סקטור` from that mapping the moment a subcategory matches,
+  instead of leaving a single-answer field for the LLM to guess (and risk
+  failing that same cross-field check on). One incidental find along the
+  way: the `סקטור` assignment itself had a latent bug unrelated to this
+  fix — the dict key was typed with two Arabic look-alike characters
+  instead of Hebrew ו/ר, so it silently failed `extra="forbid"` validation
+  and got dropped by every prior rule-path extraction that matched a
+  sector directly, not just the subcategory-only case this item set out to
+  fix. Both are now fixed and covered:
+  `test_extraction_call_never_sees_a_number_already_claimed_by_rules`,
+  `test_matched_subcategory_backfills_sector_deterministically`.
+
 ## Out-of-domain queries
 
 `_CategoryClassification.קטגוריה` is nullable. The classify-only call is
@@ -119,12 +293,53 @@ Found while building the taxonomy-driven test suite
 patched around, because fixing them would mean re-introducing exactly the
 hand-guessed vocabulary this pass removed:
 
-- **Taxonomy-inherent cross-vertical words are real ties, not gaps.**
-  `"מסחרי"` ("commercial") is literally both a vehicles `סוגי_רכב` value
-  and a real-estate `מצבי_עסקה` value — a query containing only that word
-  scores a genuine 1-1 tie, broken toward `Vertical.REAL_ESTATE` (declared
-  first), with real but modest confidence (`test_vehicle_type_words_shared_with_other_verticals_are_a_real_tie`).
-  Disambiguates correctly the moment there's a second signal either way.
+- **Taxonomy-inherent cross-vertical words are real ties, not gaps** —
+  and no longer trusted as a hint. `"מסחרי"` ("commercial") is literally
+  both a vehicles `סוגי_רכב` value and a real-estate `מצבי_עסקה` value — a
+  query containing only that word scores a genuine 1-1 tie at
+  `classify_query`'s own level, still broken toward `Vertical.REAL_ESTATE`
+  (declared first) there (`test_vehicle_type_words_shared_with_other_verticals_are_a_real_tie`),
+  but the pipeline now routes any tied score through the classify-only call
+  instead of trusting it — see "The same bug at nonzero confidence" above.
+- **Single, non-tied spurious *general_attribute* matches are fixed** —
+  `"תנור אפייה חשמלי ..."` (electric oven) used to score a *sole* vehicles
+  match via `"חשמלי"` (electric, a real `סוג_דלק` value) with nothing
+  competing — no tie to route on, so it was trusted as a hint and
+  misclassified. Resolved by the `general_attributes`-exclusion fix (see
+  "`general_attributes` values don't count toward classification score"
+  above): `"חשמלי"` no longer scores at all, so this query now reaches the
+  clean `confidence == 0.0` gate directly
+  (`test_generic_fuel_type_word_alone_reaches_zero_signal`). What remains
+  genuinely open is narrower: a single **correct, identifying** match (not
+  a general attribute) for a vertical the query isn't really about,
+  because the *true* vertical has no taxonomy vocabulary at all to compete
+  with it — see `"פטיפון"` below, which is exactly that case, not a
+  variant of this one.
+- **Some product categories have no taxonomy sector at all — thin or
+  absent `יד_שנייה` coverage, not a classifier bug.** `מקרר` (fridge) and
+  other kitchen appliances: none of `יד_שנייה`'s sectors
+  (`אלקטרוניקה`/`ריהוט`/`ספורט_וקמפינג`/`לתינוקות_וסופגנים`/`מוסיקה_וכלים`)
+  include one. `מוסיקה_וכלים` itself is a second, milder instance of the
+  same gap, not a separate issue: its subcategory list is only `גיטרות`
+  (guitars) and `קלידים` (keyboards) — live-verified, "פסנתר עומד ימאהה U1
+  ..." (an upright piano) is close enough to fit `קלידים`, a plausible
+  though imperfect match, at degraded confidence (LLM extraction produced
+  no valid fields beyond `מחיר`); "פטיפון טכניקס SL-1200 ..." (a turntable)
+  has no plausible subcategory anywhere in the taxonomy, and — live-
+  verified, post-fix — the rule path's own sole matched term is a real,
+  correct **city** match (`חיפה`, not a general attribute, so unaffected
+  by the fix above), which gets trusted as a hint into the wrong vertical
+  entirely (`נדל״ן`, confidence 0.4) since there's nothing left in the
+  query for `יד_שנייה` to compete with and make it a tie. This is a
+  sharper illustration of the same underlying problem than a wrong-
+  subcategory guess would be: even a piece of genuinely correct signal
+  can't rescue a query when the actual right vertical has nothing at all
+  to offer. In all three cases, zero-or-thin taxonomy coverage means
+  there's no correct answer for the rule path or the LLM to converge on —
+  see `docs/examples.md`'s control set and
+  `test_confidence_zero_taxonomy_sector_query_reaches_classify_only_gate`.
+  Not addressed by adding taxonomy content — `data/taxonomy.json` is this
+  assignment's fixed source of truth, not something to invent scope into.
 - **A pre-existing normalizer quirk**: `"למכירה"` ("for sale") isn't
   taxonomy vocabulary, but it's a close enough fuzzy match (one extra
   leading letter) to real estate's own `"מכירה"` term to clear the fuzzy
@@ -258,7 +473,16 @@ invented-precise number):
 
 Even the conservative scenario is ~$2,100/month for 10M queries — the LLM
 only ever touches the minority of traffic the rule path can't confidently
-resolve. Levers implemented: full-response + word-level normalization
+resolve. The 60-65% "rules share of misses" figures above predate this
+pass's `general_attributes` scoring fix, which — by design — makes some
+rule-path confidence scores lower than before (a color or transmission
+word no longer counts as "explained"); two of the eight worked examples in
+`docs/examples.md` now fall below `confidence_threshold` where they didn't
+before. Directionally this shifts real traffic toward the LLM path
+somewhat, not toward rules — flagged here as needing re-measurement
+against real traffic, same as the split itself always needed, rather than
+re-deriving a new invented-precise number from no production data either
+way. Levers implemented: full-response + word-level normalization
 caching, the rule-first classifier itself, two-tier escalation, schema
 scoping (`llm_fallback_service._scoped_strict_json_schema`, -8% completion
 tokens / -12% latency per fallback call, measured). Embeddings

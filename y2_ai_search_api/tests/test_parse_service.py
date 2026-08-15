@@ -66,8 +66,10 @@ async def test_concurrent_identical_queries_each_resolve_independently(monkeypat
     monkeypatch.setattr(OpenAIRepository, "embed", staticmethod(fake_embed))
 
     # No coalescing: N concurrent identical requests each pay their own
-    # LLM call now, not sharing one.
-    query = "דירה בירושלים עד מיליון שח"
+    # LLM call now, not sharing one. Sparse-signal query (not a bare city
+    # match, which now clears confidence_threshold on the rule path alone
+    # with general_attributes excluded from scoring).
+    query = "דירה יפה מאוד עם נוף פתוח יוצא דופן ריכוזי מרפסת ענקית"
     concurrency = 10
     results = await asyncio.gather(*(parse_service.parse_query(query) for _ in range(concurrency)))
 

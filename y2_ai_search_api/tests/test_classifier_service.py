@@ -112,19 +112,62 @@ def test_for_sale_phrasing_no_longer_tips_ambiguously_toward_used_goods():
 
 
 def test_vehicle_type_words_shared_with_other_verticals_are_a_real_tie():
-    # Disclosed, not fixed: "מסחרי" ("commercial") is literally both a
-    # vehicles סוגי_רכב value *and* a real-estate מצבי_עסקה value -- the
-    # taxonomy itself makes this word genuinely ambiguous, not a gap in cue-
-    # word derivation. Scored as a real 1-1 tie (see margin_factor); the
-    # tie-break still favors Vertical.REAL_ESTATE (declared first), same as
-    # the zero-confidence default -- but this is a *scored* tie with real
-    # partial signal (confidence > 0), which is exactly why item 1's
-    # zero-signal-only gate (confidence == 0.0 precisely) doesn't -- and
-    # shouldn't -- catch it: routing every non-zero tie through an LLM call
-    # would defeat the rule path's entire cost advantage for a case this
-    # taxonomy-inherent. A query that actually needs "מסחרי" disambiguated
-    # resolves correctly once paired with a real signal either way, e.g.
-    # "רכב מסחרי" (see test_taxonomy_generated_classification.py).
+    # "מסחרי" ("commercial") is literally both a vehicles סוגי_רכב value
+    # *and* a real-estate מצבי_עסקה value -- the taxonomy itself makes this
+    # word genuinely ambiguous, not a gap in cue-word derivation. Scored as
+    # a real 1-1 tie (see margin_factor); classify_query's own tie-break
+    # still favors Vertical.REAL_ESTATE (declared first, same mechanics as
+    # the zero-confidence default) at the classify_query level -- but
+    # is_tied=True now means the pipeline (services.parse_service) doesn't
+    # trust that pick as a hint: it routes through the classify-only LLM
+    # call instead, same as confidence == 0.0. See
+    # test_zero_signal_classification.py for the full-pipeline behavior.
     result = _classify("מסחרי עד 100000 שח")
     assert result.vertical == Vertical.REAL_ESTATE  # the tie-break, documented
     assert 0.0 < result.confidence < 0.5  # genuinely low, not confidently wrong
+    assert result.is_tied is True
+
+
+def test_furniture_material_word_no_longer_competes_with_a_real_furniture_match():
+    # "שולחן" (table) correctly matches יד_שנייה's סוגי_רהיט. "מלא" (in
+    # "אלון מלא", solid oak) is also a real, literal נדל״ן ריהוט value
+    # (furnished status: ללא/חלקי/מלא) -- but ריהוט is a general_attributes
+    # field (a property of an already-identified item, not identifying
+    # signal), so it no longer counts toward classification score at all.
+    # יד_שנייה wins outright now, no tie, no coin flip.
+    result = _classify("שולחן אבירים אלון מלא פרדס חנה כרכור 3000 שח")
+    assert result.is_tied is False
+    assert result.vertical == Vertical.USED_GOODS
+    assert result.confidence > 0.0
+
+
+def test_typo_corrected_word_no_longer_ties_reaches_zero_signal_instead():
+    # "טאבון" (tabun oven) no longer fuzzy-corrupts to "טאבו" (land-registry
+    # status) -- FUZZY_MATCH_MIN_SCORE was raised past both words' 88.89
+    # similarity score. "גז" (gas) still matches רכב's own סוג_דלק, but
+    # סוג_דלק is general_attributes too, so it no longer counts toward
+    # score either. Zero identifying signal for any vertical -- the clean
+    # zero-signal gate (confidence == 0.0) catches this directly now, no
+    # tie-detection needed.
+    result = _classify("טאבון גז אוני קודה 16 מודיעין 2000 שח")
+    assert result.confidence == 0.0
+    assert result.is_tied is False
+
+
+def test_generic_fuel_type_word_alone_reaches_zero_signal():
+    # "חשמלי" (electric) is a real רכב סוג_דלק value, but describes ovens,
+    # bikes, guitars just as often as cars -- general_attributes exclusion
+    # means it no longer manufactures a confident (wrong) vehicles pick on
+    # its own for a non-vehicle query.
+    result = _classify("תנור אפייה חשמלי כרמיאל 1200 שח")
+    assert result.confidence == 0.0
+
+
+def test_general_attribute_term_matches_are_excluded_from_scoring_not_from_occurrences():
+    # "מלא" is still recorded in term_occurrences (extraction needs it once
+    # a vertical is otherwise established) -- it's just excluded from the
+    # score that decides which vertical wins in the first place.
+    canonical = normalize_query(sanitize_query("דירת 3 חדרים מלא בירושלים עד מליון שח"))
+    result = classify_query(canonical)
+    assert result.vertical == Vertical.REAL_ESTATE
+    assert any(o.matched_text == "מלא" for o in result.term_occurrences)

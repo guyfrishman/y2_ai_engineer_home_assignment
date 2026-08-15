@@ -13,7 +13,7 @@ from repositories.taxonomy_repository import HEBREW_STOPWORDS, taxonomy_reposito
 from text_normalization import build_mark_tolerant_alternation, build_mark_tolerant_pattern
 
 WORD_CORRECTION_CACHE_SIZE = 8192
-FUZZY_MATCH_MIN_SCORE = 85  # rapidfuzz 0-100 similarity; below this, leave the word as-is
+FUZZY_MATCH_MIN_SCORE = 90  # rapidfuzz 0-100 similarity; below this, leave the word as-is
 MIN_WORD_LENGTH_FOR_CORRECTION = 3  # shorter words (prepositions, "עד", "בן") fuzzy-match unreliably
 
 _THOUSAND_MULTIPLIER = 1_000

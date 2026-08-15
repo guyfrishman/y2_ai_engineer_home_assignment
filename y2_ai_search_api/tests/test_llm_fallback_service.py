@@ -38,6 +38,55 @@ def _rule_path_params() -> object:
     return taxonomy_repository.params_models[Vertical.VEHICLES](יצרן="טויוטה")
 
 
+def test_mask_claimed_numbers_blanks_a_price_already_claimed_by_rules():
+    rule_path_params = taxonomy_repository.params_models[Vertical.VEHICLES](יצרן="סוזוקי", מחיר=95000)
+    masked = llm_fallback_service._mask_claimed_numbers(
+        "סוזוקי ג'ימני ידני קצרין רמת הגולן 95000 ש״ח", rule_path_params
+    )
+    assert "95000" not in masked
+    assert "סוזוקי" in masked and "קצרין" in masked
+
+
+def test_mask_claimed_numbers_blanks_range_bounds_too():
+    rule_path_params = taxonomy_repository.params_models[Vertical.VEHICLES](מחיר={"min": 1000, "max": 2000})
+    masked = llm_fallback_service._mask_claimed_numbers("בין 1000 ל2000 שח", rule_path_params)
+    assert "1000" not in masked
+    assert "2000" not in masked
+
+
+def test_mask_claimed_numbers_leaves_text_unchanged_when_nothing_numeric_claimed():
+    rule_path_params = taxonomy_repository.params_models[Vertical.VEHICLES](יצרן="סוזוקי")
+    text = "סוזוקי ג'ימני 95000 שח"
+    assert llm_fallback_service._mask_claimed_numbers(text, rule_path_params) == text
+
+
+async def test_extraction_call_never_sees_a_number_already_claimed_by_rules(monkeypatch):
+    # The exact reported case: "...95000 ש״ח" -- rules correctly claim it as
+    # מחיר. Before this fix, the LLM (asked to fill ק״מ among other fields,
+    # with מחיר excluded from its scoped schema) could see the bare number
+    # still sitting in the query text and reinvent it as ק״מ, double-
+    # claiming one number as two different fields. Masking the claimed
+    # number out of what the LLM is shown removes the number it would have
+    # had to invent a second meaning for.
+    captured_messages = []
+
+    async def fake_chat(messages, model, response_format=None, logprobs=False, max_completion_tokens=None):
+        captured_messages.append(messages)
+        return _fake_response({"ק״מ": None, "תיבת_הילוכים": None})
+
+    monkeypatch.setattr(llm_fallback_service.OpenAIRepository, "chat", staticmethod(fake_chat))
+
+    rule_path_params = taxonomy_repository.params_models[Vertical.VEHICLES](יצרן="סוזוקי", מחיר=95000)
+    result = await llm_fallback_service.run_llm_fallback(
+        Vertical.VEHICLES, "סוזוקי ג'ימני ידני קצרין רמת הגולן 95000 ש״ח", rule_path_params
+    )
+
+    user_message_content = captured_messages[0][1]["content"]
+    assert "95000" not in user_message_content
+    assert "ק״מ" not in result.params.model_dump(exclude_none=True)
+    assert result.params.model_dump(exclude_none=True)["מחיר"] == 95000
+
+
 async def test_tier1_success_never_calls_tier2(monkeypatch):
     calls = []
 

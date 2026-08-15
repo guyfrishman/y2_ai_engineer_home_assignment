@@ -252,10 +252,17 @@ def extract_used_goods_params(canonical_query: str, occurrences: list[TermOccurr
 
     sector = _first_field_value(occurrences, "סקטור")
     if sector:
-        params["סקטور"] = sector
+        params["סקטור"] = sector
     subcategory = _first_field_value(occurrences, "תת_קטגוריה")
     if subcategory:
         params["תת_קטגוריה"] = subcategory
+        if not sector:
+            # A matched subcategory has exactly one valid sector -- the same
+            # mapping schema.taxonomy_models's cross-field validator uses.
+            # Backfill it deterministically rather than leaving a
+            # single-answer field for the LLM to guess (and risk failing
+            # that same cross-field check on).
+            params["סקטור"] = taxonomy_repository.used_goods_subcategory_to_sector[subcategory]
 
     for field_name in (
         "מותג", "מצב", "צבע", "אזור", "עיר", "מעבד", "טכנולוגיה",

@@ -1,5 +1,6 @@
 """Zero-signal queries (classification.confidence == 0.0 -- zero taxonomy-
-term/cue-word evidence for every vertical) must not silently default to
+term/cue-word evidence for every vertical) and tied queries (>=2 verticals
+score equally, classification.is_tied) must not silently default to
 Vertical's first-declared member via max()'s tie-break. See
 services.parse_service._run_llm_branch and services.llm_fallback_service.
 run_category_classification.
@@ -194,6 +195,89 @@ async def test_null_category_is_cached_like_any_other_response(monkeypatch):
     assert second.response.category is None
 
 
+# --- taxonomy-coverage boundary: מקרר (fridge) has no matching sector in
+# יד_שנייה -- a genuine gap in data/taxonomy.json, not a classifier bug. See
+# docs/DESIGN.md's "Known, disclosed limitations".
+
+
+def test_confidence_zero_taxonomy_sector_query_reaches_classify_only_gate():
+    canonical = normalize_query(sanitize_query("מקרר 4 דלתות התקן שבת אשדוד 3200 שח"))
+    result = classify_query(canonical)
+    assert result.confidence == 0.0
+    assert result.term_occurrences == []
+
+
+async def test_missing_taxonomy_sector_query_degrades_to_honest_null(monkeypatch):
+    monkeypatch.setattr(OpenAIRepository, "chat", staticmethod(_fake_chat_with_classification(None)))
+
+    result = await parse_service.parse_query("מקרר 4 דלתות התקן שבת אשדוד 3200 שח")
+
+    assert result.response.category is None
+    assert result.path == "null"
+    assert result.response.confidence == llm_fallback_service.NOT_APPLICABLE_CONFIDENCE
+
+
+# --- שולחן/טאבון: the two live-reported misclassification-toward-נדל״ן
+# cases. Root cause was two-layered (see docs/DESIGN.md): a normalizer
+# fuzzy-match false correction (טאבון -> טאבו) and general_attributes term
+# matches ("מלא", "גז") counting toward classification score on their own.
+# Both layers are fixed now; see test_classifier_service.py for the
+# unit-level scoring behavior these full-pipeline tests build on.
+
+
+async def _fake_embed(text, model=None):
+    return [1.0, 0.0]
+
+
+async def test_furniture_query_resolves_directly_to_used_goods_no_classify_call_needed(monkeypatch):
+    # With general_attributes excluded from scoring (services.classifier_service
+    # ._matched_word_count), "מלא" no longer competes with "שולחן" at all --
+    # the rule path picks יד_שנייה outright, correctly, as a hint straight
+    # into extraction. No tie, no classify-only call needed.
+    calls = {"classify": 0}
+
+    async def fake_chat(messages, model, response_format=None, logprobs=False, max_completion_tokens=None):
+        schema_name = (response_format or {}).get("json_schema", {}).get("name")
+        if schema_name == "query_category":
+            calls["classify"] += 1
+        content = "{}"
+        token_logprobs = [SimpleNamespace(token=character, logprob=-0.01) for character in content]
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=content),
+                    logprobs=SimpleNamespace(content=token_logprobs),
+                )
+            ],
+            usage=SimpleNamespace(prompt_tokens=10, completion_tokens=1, total_tokens=11),
+        )
+
+    monkeypatch.setattr(OpenAIRepository, "chat", staticmethod(fake_chat))
+    monkeypatch.setattr(OpenAIRepository, "embed", staticmethod(_fake_embed))
+
+    result = await parse_service.parse_query("שולחן אבירים אלון מלא פרדס חנה כרכור 3000 שח")
+
+    assert calls["classify"] == 0
+    assert result.response.category == Vertical.USED_GOODS
+    assert result.path == "llm"
+
+
+async def test_typo_corrected_query_reaches_zero_signal_gate_not_forced_to_real_estate(monkeypatch):
+    # With FUZZY_MATCH_MIN_SCORE raised, "טאבון" no longer corrupts to
+    # "טאבו", and "גז" (general_attributes) no longer counts toward score --
+    # zero identifying signal for any vertical, the same clean
+    # confidence == 0.0 gate as the jeep repro, not a tie.
+    monkeypatch.setattr(
+        OpenAIRepository, "chat", staticmethod(_fake_chat_with_classification(Vertical.USED_GOODS.value))
+    )
+    monkeypatch.setattr(OpenAIRepository, "embed", staticmethod(_fake_embed))
+
+    result = await parse_service.parse_query("טאבון גז אוני קודה 16 מודיעין 2000 שח")
+
+    assert result.response.category == Vertical.USED_GOODS
+    assert result.path == "llm"
+
+
 async def test_partial_signal_below_threshold_still_uses_rule_vertical_as_hint(monkeypatch):
     # 0 < confidence < threshold must NOT go through the classify-only path
     # -- classification.vertical is a real, partial signal here, not a
@@ -224,7 +308,12 @@ async def test_partial_signal_below_threshold_still_uses_rule_vertical_as_hint(m
     monkeypatch.setattr(OpenAIRepository, "chat", staticmethod(fake_chat))
     monkeypatch.setattr(OpenAIRepository, "embed", staticmethod(fake_embed))
 
-    result = await parse_service.parse_query("דירה בירושלים עד מיליון שח")
+    # A sparse-signal real estate query ("דירה" plus unmatched descriptive
+    # filler, nothing scoring for any other vertical) -- a city/property-
+    # type-rich query no longer works for this test, since those now clear
+    # the threshold outright with general_attributes correctly excluded
+    # from competing against them.
+    result = await parse_service.parse_query("דירה יפה מאוד עם נוף פתוח יוצא דופן ריכוזי מרפסת ענקית")
 
     assert calls["classify"] == 0
     assert calls["extract"] == 1

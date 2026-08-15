@@ -14,6 +14,7 @@ No Tier 3. See docs/DESIGN.md.
 
 import functools
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Literal
@@ -154,6 +155,36 @@ class TierCallResult:
     failure_reason: str | None = None
 
 
+def _mask_claimed_numbers(text: str, rule_path_params: BaseModel) -> str:
+    """Blank out digit sequences the rule path already attributed to a
+    field, so the extraction call can't independently re-derive a
+    *different* field from the same number. The rule extractor's own
+    span-consumption already prevents this within a single rule-path pass
+    (e.g. a room count and a price can't both claim the same digits) — but
+    it only clears digits from its own working copy of the text, never the
+    canonical_query the LLM is shown, so that protection stopped at the
+    rule/LLM boundary. A price number with no other numeric cue nearby
+    (e.g. "... 95000 ש״ח" with no "ק״מ" in sight) was observed getting
+    claimed by the rule path as מחיר *and independently reinvented* by the
+    LLM as ק״מ, since the model never learns Tier 1's a number is already
+    spoken for. See docs/DESIGN.md.
+    """
+    numbers: set[str] = set()
+    for value in rule_path_params.model_dump(exclude_none=True).values():
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            numbers.add(str(int(value)) if float(value).is_integer() else str(value))
+        elif isinstance(value, dict):
+            for bound in value.values():
+                if isinstance(bound, (int, float)) and not isinstance(bound, bool):
+                    numbers.add(str(int(bound)) if float(bound).is_integer() else str(bound))
+    if not numbers:
+        return text
+    pattern = re.compile(r"(?<!\d)(" + "|".join(re.escape(n) for n in numbers) + r")(?!\d)")
+    return pattern.sub(lambda match: " " * len(match.group(0)), text)
+
+
 async def _call_tier(
     vertical: Vertical, canonical_query: str, model_name: str, tier_label: str, rule_path_params: BaseModel
 ) -> TierCallResult:
@@ -164,9 +195,13 @@ async def _call_tier(
     model_class = taxonomy_repository.params_models[vertical]
     already_known_fields = frozenset(rule_path_params.model_dump(exclude_none=True).keys())
     scoped_schema = _scoped_strict_json_schema(model_class, already_known_fields)
+    # Numbers the rule path already claimed are masked out here, not in
+    # canonical_query itself: compute_llm_confidence's embedding cross-check
+    # (called separately, below) still needs the full, unmasked query text.
+    query_for_extraction = _mask_claimed_numbers(canonical_query, rule_path_params)
     messages = [
         {"role": "system", "content": build_extraction_system_prompt(vertical)},
-        {"role": "user", "content": canonical_query},
+        {"role": "user", "content": query_for_extraction},
     ]
     response_format = {
         "type": "json_schema",

@@ -139,6 +139,19 @@ def test_lenovo_laptop_partial_extraction():
     assert params["מותג"] == "לנובו"
 
 
+def test_matched_subcategory_backfills_sector_deterministically():
+    # "אופניים" (bicycles) matches תת_קטגוריה directly -- its parent sector
+    # (ספורט_וקמפינג) is unambiguous, so it's backfilled deterministically
+    # rather than left as a single-answer field for the LLM to guess (and
+    # risk failing the same סקטור/תת_קטגוריה cross-field check the LLM
+    # extraction path is scored against). No LLM call needed for this
+    # field at all now: it's already in already_known_fields, out of the
+    # scoped schema the fallback tiers are even asked about.
+    params = _parse_with_rules("אופניים חשמליים מתקפלים 48V תל אביב 2300 שח")
+    assert params["תת_קטגוריה"] == "אופניים"
+    assert params["סקטור"] == "ספורט_וקמפינג"
+
+
 def test_extracted_params_reject_fields_outside_taxonomy():
     # extract_params validates through the taxonomy Pydantic model, which
     # has extra="forbid" — there is no code path that can smuggle an

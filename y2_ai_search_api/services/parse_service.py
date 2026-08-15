@@ -122,11 +122,14 @@ def _resolve_via_rules(
 async def _run_llm_branch(
     classification: ClassificationResult, rule_path_params: BaseModel, canonical_query: str, cache_key: str
 ) -> ParseResult:
-    """Below-threshold rule confidence. Zero signal (== 0.0) resolves the
-    category via a classify-only call first; partial signal keeps
-    classification.vertical as a hint straight into the extraction cascade."""
+    """Below-threshold rule confidence. Zero signal (== 0.0) or a genuine
+    top-score tie between verticals resolves the category via a
+    classify-only call first -- in both cases `classification.vertical` is
+    just max()'s tie-break, not real evidence. Any other partial signal
+    keeps classification.vertical as a hint straight into the extraction
+    cascade."""
     vertical = classification.vertical
-    if classification.confidence == 0.0:
+    if classification.confidence == 0.0 or classification.is_tied:
         outcome = await run_category_classification(canonical_query)
         if outcome.failed:
             return _degrade_to_rule_path_default(classification, rule_path_params, cache_key)

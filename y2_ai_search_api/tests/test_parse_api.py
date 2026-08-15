@@ -19,20 +19,38 @@ def test_health_is_open_and_reports_taxonomy_version(client):
     assert body["taxonomy_version"]
 
 
-def test_parse_vehicle_golden_example_resolves_via_rules(client):
-    response = client.post("/parse", json={"q": "טויוטה קורולה 2018-2021 עד 70 אלף שח צבע לבן"})
+def test_parse_real_estate_golden_example_resolves_via_rules(client):
+    # "דירת" (construct-state form of "דירה") doesn't match the exact
+    # taxonomy term "דירה" -- no stemming, a known, disclosed limitation
+    # (see docs/DESIGN.md) -- so סוגי_נכס goes unextracted here; not
+    # something this pass changes.
+    response = client.post("/parse", json={"q": "דירת 3 חדרים בירושלים עד מליון שח"})
     assert response.status_code == 200
     assert response.headers["x-parse-path"] == "rules"
     body = response.json()
-    assert body["category"] == "רכב"
+    assert body["category"] == "נדל״ן"
     assert body["params"] == {
-        "יצרן": "טויוטה",
-        "דגם": "קורולה",
-        "שנה": {"min": 2018, "max": 2021},
-        "מחיר": {"max": 70000},
-        "צבע": "לבן",
+        "מס׳_חדרים": 3,
+        "עיר": "ירושלים",
+        "מחיר": {"max": 1000000},
     }
     assert 0.0 <= body["confidence"] <= 1.0
+
+
+def test_parse_vehicle_golden_example_resolves_via_llm_with_correct_category(client, mock_llm):
+    # This exact assignment-brief query (INSTRUCTIONS.md example 2) no
+    # longer clears confidence_threshold on the rule path alone: "לבן"
+    # (color) is a general_attributes value, correctly excluded from
+    # classification score (see docs/DESIGN.md's cue-word audit) -- the
+    # rule path's own vertical pick (רכב, via יצרן/דגם) is still right,
+    # just below-threshold now, so it's correctly passed as a hint into
+    # the extraction cascade rather than trusted outright. mock_llm
+    # returns empty synthetic params, so only the category is checked here
+    # -- see docs/examples.md for the live, real-API-verified params.
+    response = client.post("/parse", json={"q": "טויוטה קורולה 2018-2021 עד 70 אלף שח צבע לבן"})
+    assert response.status_code == 200
+    assert response.headers["x-parse-path"] == "llm"
+    assert response.json()["category"] == "רכב"
 
 
 def test_parse_without_openai_key_degrades_gracefully_instead_of_500ing(client, monkeypatch):
@@ -43,10 +61,10 @@ def test_parse_without_openai_key_degrades_gracefully_instead_of_500ing(client, 
     monkeypatch.setattr(settings, "openai_api_key", "")
     # A low-confidence query should still return 200 with a usable (if
     # low-confidence) result, never fail the request just because the LLM
-    # fallback was unreachable. "ירושלים" is a genuine cross-vertical term
-    # (a נדל״ן city *and* a יד_שנייה region), which is what keeps this below
-    # confidence_threshold.
-    response = client.post("/parse", json={"q": "דירה בירושלים עד מיליון שח"})
+    # fallback was unreachable. Sparse-signal real estate query: "דירה"
+    # matches, but nothing else does, keeping this below confidence_threshold
+    # without tying against another vertical.
+    response = client.post("/parse", json={"q": "דירה יפה מאוד עם נוף פתוח יוצא דופן ריכוזי מרפסת ענקית"})
     assert response.status_code == 200
     assert response.headers["x-parse-path"] == "llm"
     body = response.json()
@@ -59,13 +77,13 @@ def test_parse_without_openai_key_degrades_gracefully_instead_of_500ing(client, 
 
 
 def test_parse_with_mocked_llm_resolves_via_llm_path(client, mock_llm):
-    response = client.post("/parse", json={"q": "דירה בירושלים עד מיליון שח"})
+    response = client.post("/parse", json={"q": "דירה יפה מאוד עם נוף פתוח יוצא דופן ריכוזי מרפסת ענקית"})
     assert response.status_code == 200
     assert response.headers["x-parse-path"] == "llm"
 
 
 def test_repeated_query_hits_cache_on_second_call(client):
-    query = {"q": "טויוטה קורולה 2018-2021 עד 70 אלף שח צבע לבן"}
+    query = {"q": "דירת 3 חדרים בירושלים עד מליון שח"}
 
     first = client.post("/parse", json=query)
     assert first.headers["x-parse-path"] == "rules"

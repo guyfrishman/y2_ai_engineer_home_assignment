@@ -10,7 +10,7 @@ import pytest
 
 from repositories.taxonomy_repository import taxonomy_repository
 from schema.taxonomy_models import Vertical
-from services.classifier_service import classify_query
+from services.classifier_service import _scan_term_occurrences, _vertical_scores, classify_query
 from services.normalizer_service import normalize_query
 from services.sanitizer_service import sanitize_query
 
@@ -114,3 +114,40 @@ def test_vehicle_combinatorial_classification(query):
 def test_used_goods_combinatorial_classification(query):
     result = _classify(query)
     assert result.vertical == Vertical.USED_GOODS, f"{query!r} -> {result.vertical}"
+
+
+# Every (term, vertical) pair walked directly from the taxonomy (not
+# hand-picked) where *every* match under that vertical is
+# general_attributes-sourced -- "מלא"/"חשמלי"/"גז" were the reported cases,
+# but the fix (TaxonomyTermMatch.is_general_attribute) is a blanket rule,
+# and this proves it holds for every such pair, not just the two caught
+# live. Deliberately excludes pairs like "פרטי"/רכב (also a real סוגי_רכב
+# value -- private-car body type is genuine identifying signal, not just
+# the generic "פרטי" ownership descriptor) and used-goods' own מצב values
+# ("חדש", "משומש", ...), which double as real per-subcategory condition
+# terms in addition to the general default -- those legitimately still
+# score, and asserting otherwise would be testing a rule broader than the
+# one actually implemented.
+_PURELY_GENERAL_PAIRS = sorted(
+    {
+        (term, match.vertical)
+        for term, matches in taxonomy_repository.term_index.items()
+        for match in matches
+        if match.is_general_attribute
+        and all(m.is_general_attribute for m in matches if m.vertical == match.vertical)
+    },
+    key=lambda pair: (pair[0], pair[1].value),
+)
+
+
+def test_purely_general_attribute_pairs_exist_to_audit():
+    assert len(_PURELY_GENERAL_PAIRS) >= 20
+
+
+@pytest.mark.parametrize("term_and_vertical", _PURELY_GENERAL_PAIRS)
+def test_purely_general_attribute_value_does_not_score_its_vertical_alone(term_and_vertical):
+    term, vertical = term_and_vertical
+    canonical = normalize_query(sanitize_query(term))
+    occurrences = _scan_term_occurrences(canonical)
+    scores = _vertical_scores(occurrences, canonical.split())
+    assert scores[vertical] == 0, f"{term!r} alone scored {scores[vertical]} for {vertical}"
