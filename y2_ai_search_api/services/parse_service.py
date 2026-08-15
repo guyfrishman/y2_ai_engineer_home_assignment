@@ -32,10 +32,6 @@ class ParseResult:
 
 
 async def parse_query(raw_query: str) -> ParseResult:
-    # No in-flight request coalescing: only dedupes within one process, not
-    # across replicas -- not worth the Future/CancelledError complexity for
-    # a guarantee that's incomplete by construction. A real fix needs a
-    # distributed primitive (Redis SETNX + pub/sub); out of scope.
     started_at = time.perf_counter()
     result: ParseResult | None = None
     canonical_query: str | None = None
