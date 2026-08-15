@@ -233,7 +233,7 @@ def _print_report(results: LoadTestResults) -> None:
             "\nNOTE: llm-path p50 is under 50ms, which is far faster than a real "
             "model round trip — this almost certainly means OPENAI_API_KEY isn't "
             "configured on the server and requests are resolving via the fast "
-            "api_error -> degrade path, not a real Tier 1/Tier 2 call. Re-run "
+            "api_error -> degrade path, not a real Tier 1 call. Re-run "
             "against a server with a real key for authoritative model-path numbers."
         )
 

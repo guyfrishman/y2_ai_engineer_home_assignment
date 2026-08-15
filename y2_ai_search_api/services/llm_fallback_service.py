@@ -1,15 +1,10 @@
-"""Two-tier LLM fallback, only invoked when the rule path's confidence is
+"""Single-tier LLM fallback, only invoked when the rule path's confidence is
 below settings.confidence_threshold.
 
-  Tier 1 (cheap, settings.openai_fallback_model) -> on api_error -> Tier 2
-  (stronger, settings.openai_escalation_model) -> on api_error or
-  validation failure -> degrade to the rule path's own result.
+  Tier 1 (settings.openai_fallback_model) -> on any failure (api_error or
+  validation failure) -> degrade to the rule path's own result.
 
-  A Tier 1 *validation* failure does not escalate: a schema-valid response
-  the model couldn't produce once is not more likely on a second, unrelated
-  attempt. Only api_error escalates.
-
-No Tier 3. See docs/DESIGN.md.
+See docs/DESIGN.md.
 """
 
 import functools
@@ -30,8 +25,8 @@ from repositories.taxonomy_repository import taxonomy_repository
 from schema.taxonomy_models import Vertical
 from services.llm_confidence_service import compute_llm_confidence
 
-# Fixed and categorically different from the two measured tiers below: with
-# no successful generation from either tier, there is nothing to measure,
+# Fixed and categorically different from the measured tier below: with
+# no successful generation from the tier, there is nothing to measure,
 # so this is an honest fixed "unknown," not a measurement.
 DEGRADED_CONFIDENCE = 0.15
 DEGRADED_NOTE = "low-confidence extraction — model fallback did not produce a valid result"
@@ -60,7 +55,7 @@ MAX_FALLBACK_COMPLETION_TOKENS = 400
 class LlmFallbackResult:
     params: BaseModel
     confidence: float
-    tier_used: str  # "tier1" | "tier2" | "degraded"
+    tier_used: str  # "tier1" | "degraded"
     notes: list[str] = field(default_factory=list)
 
 
@@ -144,10 +139,8 @@ def _scoped_strict_json_schema(model_class: type[BaseModel], already_known_field
 @dataclass(frozen=True)
 class TierCallResult:
     """failure_reason: None on success, "api_error", or "validation_failed"
-    (invalid JSON or schema violation) -- run_llm_fallback escalates to
-    Tier 2 on api_error, but not on validation_failed (a schema-valid
-    response the model couldn't produce once isn't likely to appear on a
-    second, unrelated attempt either)."""
+    (invalid JSON or schema violation) -- run_llm_fallback degrades to the
+    rule path's own result on either failure reason."""
 
     params: BaseModel | None
     token_logprobs: list | None
@@ -384,28 +377,6 @@ async def run_llm_fallback(
             vertical,
         )
         return LlmFallbackResult(params=tier1.params, confidence=confidence, tier_used="tier1")
-
-    if tier1.failure_reason == "validation_failed":
-        # No escalation: a schema-valid response the model couldn't
-        # produce once is not more likely on a second, unrelated attempt.
-        log_event(event="llm_call_outcome", tier="tier2", outcome="skipped", reason="tier1_validation_failed")
-        return LlmFallbackResult(
-            params=rule_path_params,
-            confidence=DEGRADED_CONFIDENCE,
-            tier_used="degraded",
-            notes=[DEGRADED_NOTE],
-        )
-
-    tier2 = await _call_tier(vertical, canonical_query, settings.openai_escalation_model, "tier2", rule_path_params)
-    if tier2.params is not None:
-        confidence = await compute_llm_confidence(
-            canonical_query,
-            tier2.token_logprobs,
-            list(tier2.llm_returned_fields.keys()),
-            tier2.params.model_dump(exclude_none=True),
-            vertical,
-        )
-        return LlmFallbackResult(params=tier2.params, confidence=confidence, tier_used="tier2")
 
     return LlmFallbackResult(
         params=rule_path_params,

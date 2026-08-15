@@ -22,18 +22,17 @@ class Settings(BaseSettings):
     # OpenAI — this service is OpenAI-specific by design, not a
     # swappable-provider abstraction.
     openai_api_key: str = ""
-    # gpt-5-nano/gpt-5-mini were the original picks by price, but OpenAI
-    # rejects logprobs requests on the entire gpt-5 family (verified live,
-    # 403 "not allowed to request logprobs from this model") — and this
-    # service's confidence score depends on logprobs. gpt-4.1-nano/mini are
-    # the cheapest models confirmed (live) to support both Structured
-    # Outputs strict mode and logprobs together. See docs/DESIGN.md.
+    # gpt-5-nano was the original pick by price, but OpenAI rejects logprobs
+    # requests on the entire gpt-5 family (verified live, 403 "not allowed
+    # to request logprobs from this model") — and this service's confidence
+    # score depends on logprobs. gpt-4.1-nano is the cheapest model
+    # confirmed (live) to support both Structured Outputs strict mode and
+    # logprobs together. See docs/DESIGN.md.
     openai_fallback_model: str = "gpt-4.1-nano"
-    openai_escalation_model: str = "gpt-4.1-mini"
     openai_embedding_model: str = "text-embedding-3-small"
     # Explicit, short timeout/no retries: this service already has its own
-    # retry-equivalent (Tier 1 -> Tier 2 -> degrade), so SDK-level retrying
-    # underneath that just hides failures instead of surfacing them.
+    # retry-equivalent (Tier 1 -> degrade), so SDK-level retrying underneath
+    # that just hides failures instead of surfacing them.
     openai_request_timeout_seconds: float = 5.0
     openai_max_retries: int = 0
 

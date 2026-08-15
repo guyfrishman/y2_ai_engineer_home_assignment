@@ -160,7 +160,7 @@ before any extraction is attempted:
 
 Correctly classified as רכב (vehicles), not the נדל״ן default a bare
 `max()` tie-break used to silently produce. Three real model calls: a tiny
-classify-only call (286 prompt / 8 completion tokens), Tier 1 extraction
+classify-only call (286 prompt / 8 completion tokens), extraction
 (2,995 prompt / 152 completion tokens), and the category-aware embedding
 cross-check (2 calls, 21 + 46 tokens) — see `docs/DESIGN.md` for the cost
 and latency this adds.
@@ -208,11 +208,11 @@ either way.
 | סוזוקי ג'ימני ידני קצרין רמת הגולן 95000 שח | רכב | 0.4 | correct, sparse (דגם unmatched) |
 | דירת 4 חדרים להשכרה רחביה ירושלים תקרות גבוהות 8500 שח | נדל״ן | 0.85 | clean |
 | שולחן אבירים אלון מלא פרדס חנה כרכור 3000 שח | נדל״ן | 0.4 | **wrong** — a table, not real estate ("אלון מלא" misread as ריהוט:מלא) |
-| פסנתר עומד ימאהה U1 גבעתיים 14000 שח | יד_שנייה | 0.15–0.4 | correct category; extraction varies run to run (tier1/tier2 both fail validation sometimes) |
+| פסנתר עומד ימאהה U1 גבעתיים 14000 שח | יד_שנייה | 0.15–0.4 | correct category; extraction varies run to run (validation fails sometimes) |
 | מקרר 4 דלתות התקן שבת אשדוד 3200 שח | יד_שנייה or null | 0.0–0.15 | no kitchen-appliance sector in the taxonomy at all — classify is inconsistent between null and a guess |
 | מאזדה מיאטה ידנית מקורית הרצליה 75000 שח | רכב | 0.86 | clean |
 | טאבון גז אוני קודה 16 מודיעין 2000 שח | נדל״ן | 0.4 | **wrong** — a gas burner, not real estate ("טאבון" confused with "טאבו") |
-| אופניים חשמליים מתקפלים 48V תל אביב 2300 שח | יד_שנייה | 0.15 | correct category, tier1 cross-field validation failure (subcategory/sector mismatch) |
+| אופניים חשמליים מתקפלים 48V תל אביב 2300 שח | יד_שנייה | 0.15 | correct category, cross-field validation failure (subcategory/sector mismatch) |
 | פטיפון טכניקס SL-1200 חיפה מרכז הכרמל 3800 שח | יד_שנייה | 0.4 | correct category, sparse (brand/model unmatched) |
 
 Two genuine, disclosed findings from this set, not smoothed over:

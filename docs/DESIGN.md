@@ -23,25 +23,21 @@ the rule path's confidence is below `confidence_threshold` (0.58):
   zero-signal bug" below.
 - **Partial signal** (`0 < confidence < threshold`): the rule path's own
   vertical is a real, if uncertain, hint — it's handed straight into the
-  ordinary two-tier extraction cascade, same as always.
-- **Extraction cascade** (used by both cases above): a cheap model
-  (`gpt-4.1-nano`) first, escalating to a stronger one (`gpt-4.1-mini`)
-  only on `api_error`. A Tier 1 *validation* failure (invalid JSON, or the
-  taxonomy's own schema rejects the result) degrades immediately, no
-  escalation — a schema-valid response the model couldn't produce once
-  isn't more likely on a second, unrelated attempt. If Tier 2 also fails
-  (either reason), the pipeline degrades to the rule path's own
-  (sub-threshold) result with a fixed low confidence and a notes entry,
-  rather than failing the request.
+  ordinary extraction call, same as always.
+- **Extraction** (used by both cases above): a single call to
+  `gpt-4.1-nano`. Any failure — `api_error`, or a Tier 1 *validation*
+  failure (invalid JSON, or the taxonomy's own schema rejects the result) —
+  degrades immediately to the rule path's own (sub-threshold) result with a
+  fixed low confidence and a notes entry, rather than failing the request.
 
 Every field either path can emit comes straight out of `data/taxonomy.json`,
 dynamically, via `schema/taxonomy_models.py`'s `extra="forbid"` Pydantic
 models — no code path can invent a field outside the taxonomy.
 
-`gpt-4.1-nano`/`gpt-4.1-mini`, not `gpt-5-nano`/`gpt-5-mini`: verified live
-against the real API, the entire GPT-5 family rejects `logprobs` requests
-(403 "not allowed to request logprobs from this model"), and this
-pipeline's LLM-tier confidence score depends on logprobs.
+`gpt-4.1-nano`, not `gpt-5-nano`: verified live against the real API, the
+entire GPT-5 family rejects `logprobs` requests (403 "not allowed to
+request logprobs from this model"), and this pipeline's LLM-tier
+confidence score depends on logprobs.
 
 ## The zero-signal bug
 
@@ -393,8 +389,8 @@ a lower number should correlate with a genuinely less certain extraction.
 | Path | Formula | Measured or fixed? |
 |---|---|---|
 | Rule path | `coverage_ratio * margin_factor` | Measured, per-request |
-| LLM Tier 1 / Tier 2 success | `0.7 * logprob_confidence + 0.3 * embedding_similarity`, capped at `0.4` if `embedding_similarity < 0.5` | Measured, per-response |
-| Degrade (both tiers fail, or the zero-signal classify call errors) | `0.15` | Fixed constant |
+| LLM Tier 1 success | `0.7 * logprob_confidence + 0.3 * embedding_similarity`, capped at `0.4` if `embedding_similarity < 0.5` | Measured, per-response |
+| Degrade (Tier 1 fails, or the zero-signal classify call errors) | `0.15` | Fixed constant |
 | Not applicable (classify call explicitly returns null) | `0.0` | Fixed constant |
 
 **Rule path**: `coverage_ratio` is the fraction of the query's non-stopword
@@ -465,18 +461,13 @@ Measured, real tokens (`OPENAI_API_KEY` configured, no mocking):
 | Zero-signal classify-only call (1 real call) | 286 | 8 |
 
 Verified pricing (`developers.openai.com/api/docs/pricing`, Aug 2026, USD
-per 1M tokens): `gpt-4.1-nano` $0.10/$0.40, `gpt-4.1-mini` $0.40/$1.60,
-`text-embedding-3-small` $0.02/—.
+per 1M tokens): `gpt-4.1-nano` $0.10/$0.40, `text-embedding-3-small`
+$0.02/—.
 
-**Tier 1 only** (no escalation): **$0.000410/request**. **Tier 2
-escalation**: **$0.001635/request** (estimated by applying Tier 2 pricing
-to the same measured token counts — prompt size is dominated by the fixed
-system prompt + schema, not the tier). Blended at a conservative 15%
-escalation rate (observed ~14% across this project's real testing):
-**$0.000655/request**. The classify-only call is a small, additive cost on
-top of this *only* for zero-signal queries — at 286/8 tokens and
-`gpt-4.1-nano` pricing, ~$0.00003/call, cached at the full-query level
-after the first time.
+**Extraction**: **$0.000410/request** (`gpt-4.1-nano`, a single call). The
+classify-only call is a small, additive cost on top of this *only* for
+zero-signal queries — at 286/8 tokens and `gpt-4.1-nano` pricing,
+~$0.00003/call, cached at the full-query level after the first time.
 
 Projecting to 10M queries/month (cache-hit rate and rules-vs-LLM split are
 unmeasured without real production traffic — three scenarios, not one
@@ -484,11 +475,11 @@ invented-precise number):
 
 | Scenario | Cache hit | Rules share of misses | Monthly cost | $/request (blended) |
 |---|---|---|---|---|
-| Conservative | 20% | 60% | $2,096 | $0.00021 |
-| Moderate | 50% | 60% | $1,310 | $0.00013 |
-| Optimistic | 60% | 65% | $917 | $0.00009 |
+| Conservative | 20% | 60% | $1,312 | $0.00013 |
+| Moderate | 50% | 60% | $820 | $0.00008 |
+| Optimistic | 60% | 65% | $574 | $0.00006 |
 
-Even the conservative scenario is ~$2,100/month for 10M queries — the LLM
+Even the conservative scenario is ~$1,300/month for 10M queries — the LLM
 only ever touches the minority of traffic the rule path can't confidently
 resolve. The 60-65% "rules share of misses" figures above predate this
 pass's `general_attributes` scoring fix, which — by design — makes some
@@ -500,8 +491,8 @@ somewhat, not toward rules — flagged here as needing re-measurement
 against real traffic, same as the split itself always needed, rather than
 re-deriving a new invented-precise number from no production data either
 way. Levers implemented: full-response + word-level normalization
-caching, the rule-first classifier itself, two-tier escalation, schema
-scoping (`llm_fallback_service._scoped_strict_json_schema`, -8% completion
+caching, the rule-first classifier itself, schema scoping
+(`llm_fallback_service._scoped_strict_json_schema`, -8% completion
 tokens / -12% latency per fallback call, measured). Embeddings
 are used narrowly — only for the confidence cross-check, itself only on the
 LLM-fallback path — not as the primary classifier, which is cheaper, faster,
@@ -513,8 +504,8 @@ and deterministic by design.
 |---|---|
 | Cache hit | p95 ~55ms |
 | Rules | p95 ~41ms |
-| LLM fallback (Tier 1, uncontended) | avg ~2.6s (range 1.4–4.4s) — **misses the 600ms target** |
-| Zero-signal classify + Tier 1 + confidence cross-check (example 9, live) | ~6.0s total |
+| LLM fallback (uncontended) | avg ~2.6s (range 1.4–4.4s) — **misses the 600ms target** |
+| Zero-signal classify + extraction + confidence cross-check (example 9, live) | ~6.0s total |
 
 **Root cause of the 600ms miss, isolated by holding every other variable
 fixed:** a plain chat completion with no schema runs ~500-850ms; adding
@@ -586,7 +577,7 @@ security events use a distinct `security_`-prefixed `event` tag, greppable
 separately. Every OpenAI call (`repositories/openai_repository.py`) logs
 under one consistent `event="llm_call_outcome"` tag regardless of
 success/failure, with `duration_ms` — and the tier-specific call sites in
-`llm_fallback_service.py` (`tier1`/`tier2`/`classify`) log their *own*
+`llm_fallback_service.py` (`tier1`/`classify`) log their *own*
 `duration_ms` alongside `tier`, so "how long did Tier 1 take" or "how long
 did the classify call take" reads off one line, not two correlated by
 order. `llm_confidence_service.compute_llm_confidence` logs
@@ -602,8 +593,8 @@ zero-signal-degraded) carries both `confidence` and, where relevant,
 
 Prometheus metrics at `GET /metrics`: `parse_requests_total`
 (by category), `parse_cache_result_total` (hit/miss),
-`parse_model_calls_total` (by `tier` — `tier1`/`tier2`/`classify` — and
+`parse_model_calls_total` (by `tier` — `tier1`/`classify` — and
 `outcome`), `parse_request_duration_seconds` (by path, not blended, so an
-SLA violation in one tier can't hide under a healthy aggregate),
+SLA violation can't hide under a healthy aggregate),
 `parse_tokens_total` and `parse_cost_usd_total` (by model). `GET /health`
 reports `{"status": "ok", "taxonomy_version": "..."}`.

@@ -87,7 +87,7 @@ async def test_extraction_call_never_sees_a_number_already_claimed_by_rules(monk
     assert result.params.model_dump(exclude_none=True)["מחיר"] == 95000
 
 
-async def test_tier1_success_never_calls_tier2(monkeypatch):
+async def test_tier1_success(monkeypatch):
     calls = []
 
     async def fake_chat(messages, model, response_format=None, logprobs=False, max_completion_tokens=None):
@@ -104,9 +104,7 @@ async def test_tier1_success_never_calls_tier2(monkeypatch):
     assert calls == [settings.openai_fallback_model]
 
 
-async def test_tier1_validation_failure_does_not_escalate_to_tier2(monkeypatch):
-    # A schema-valid response the model couldn't produce once isn't more
-    # likely on a second, unrelated attempt -- only api_error escalates.
+async def test_tier1_validation_failure_degrades(monkeypatch):
     calls = []
 
     async def fake_chat(messages, model, response_format=None, logprobs=False, max_completion_tokens=None):
@@ -121,48 +119,17 @@ async def test_tier1_validation_failure_does_not_escalate_to_tier2(monkeypatch):
     result = await llm_fallback_service.run_llm_fallback(Vertical.VEHICLES, "טויוטה קורולה", rule_params)
 
     assert result.tier_used == "degraded"
-    assert calls == [settings.openai_fallback_model]  # tier2 never called
-    assert result.params is rule_params
-
-
-async def test_tier1_validation_failure_degrades_without_calling_tier2(monkeypatch):
-    calls = []
-
-    async def fake_chat(messages, model, response_format=None, logprobs=False, max_completion_tokens=None):
-        calls.append(model)
-        return _fake_response({"שנה": "not-a-number"})
-
-    monkeypatch.setattr(llm_fallback_service.OpenAIRepository, "chat", staticmethod(fake_chat))
-
-    rule_params = _rule_path_params()
-    result = await llm_fallback_service.run_llm_fallback(Vertical.VEHICLES, "טויוטה קורולה", rule_params)
-
-    assert result.tier_used == "degraded"
     assert result.confidence == llm_fallback_service.DEGRADED_CONFIDENCE
     assert result.params is rule_params
     assert llm_fallback_service.DEGRADED_NOTE in result.notes
     assert calls == [settings.openai_fallback_model]
 
 
-async def test_tier1_api_error_escalates_to_tier2(monkeypatch):
+async def test_tier1_api_error_degrades(monkeypatch):
     calls = []
 
     async def fake_chat(messages, model, response_format=None, logprobs=False, max_completion_tokens=None):
         calls.append(model)
-        if model == settings.openai_fallback_model:
-            raise OpenAIUnavailableError("missing api key")
-        return _fake_response({"יצרן": "טויוטה"})
-
-    monkeypatch.setattr(llm_fallback_service.OpenAIRepository, "chat", staticmethod(fake_chat))
-
-    result = await llm_fallback_service.run_llm_fallback(Vertical.VEHICLES, "טויוטה", _rule_path_params())
-
-    assert result.tier_used == "tier2"
-    assert calls == [settings.openai_fallback_model, settings.openai_escalation_model]
-
-
-async def test_tier2_api_error_degrades(monkeypatch):
-    async def fake_chat(messages, model, response_format=None, logprobs=False, max_completion_tokens=None):
         raise OpenAIUnavailableError("no key configured")
 
     monkeypatch.setattr(llm_fallback_service.OpenAIRepository, "chat", staticmethod(fake_chat))
@@ -173,6 +140,7 @@ async def test_tier2_api_error_degrades(monkeypatch):
     assert result.tier_used == "degraded"
     assert result.confidence == llm_fallback_service.DEGRADED_CONFIDENCE
     assert result.params is rule_params
+    assert calls == [settings.openai_fallback_model]
 
 
 async def test_scoped_schema_narrows_what_is_asked_not_what_is_allowed(monkeypatch):

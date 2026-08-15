@@ -22,7 +22,7 @@ PARSE_ERRORS_TOTAL = Counter(
 PARSE_MODEL_CALLS_TOTAL = Counter(
     "parse_model_calls_total",
     "LLM fallback calls by tier and outcome",
-    ["tier", "outcome"],  # tier: tier1 | tier2 ; outcome: success | validation_failed | api_error
+    ["tier", "outcome"],  # tier: tier1 | classify ; outcome: success | validation_failed | api_error
 )
 
 # Separate histograms per path, not one blended histogram — blending would
@@ -42,13 +42,12 @@ PARSE_COST_USD_TOTAL = Counter(
 
 # Verified against developers.openai.com/api/docs/pricing (Aug 2026), USD
 # per 1M tokens. Embeddings have no "completion" side, priced at 0.
-# gpt-4.1-nano/mini, not gpt-5-nano/mini: the entire gpt-5 family rejects
-# logprobs requests (verified live, 403), which this service's confidence
-# score depends on — see docs/DESIGN.md.
+# gpt-4.1-nano, not gpt-5-nano: the entire gpt-5 family rejects logprobs
+# requests (verified live, 403), which this service's confidence score
+# depends on — see docs/DESIGN.md.
 MODEL_PRICING_USD_PER_MILLION_TOKENS: dict[str, dict[str, float]] = {
     "gpt-4.1-nano": {"prompt": 0.10, "completion": 0.40},
     "gpt-4o-mini": {"prompt": 0.15, "completion": 0.60},
-    "gpt-4.1-mini": {"prompt": 0.40, "completion": 1.60},
     "text-embedding-3-small": {"prompt": 0.02, "completion": 0.0},
 }
 

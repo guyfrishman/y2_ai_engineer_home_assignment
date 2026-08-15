@@ -33,23 +33,14 @@ rule/dictionary classify + extract
             ├─ call fails ──────────► degrade to rule path's default, confidence=0.15
             ├─ explicit null ───────► category=null, confidence=0.0, cache write, return
             ▼ (vertical picked)
-      OpenAI Tier 1 (gpt-4.1-nano, cheap)
+      LLM classify + extract - OpenAI (gpt-4.1-nano)
         │
         ├─ success ──────────────────────────────────► validate ─► cache write ─► return
         │
-        ├─ validation failure ─► degrade immediately, confidence=0.15 (no escalation)
-        │
-        └─ api_error
+        └─ validation failure / api_error
              │
              ▼
-           OpenAI Tier 2 (gpt-4.1-mini, stronger)
-             │
-             ├─ success ────────────────────────────► validate ─► cache write ─► return
-             │
-             └─ validation failure / api_error
-                  │
-                  ▼
-                degrade to rule path's own result, confidence=0.15, notes flag
+           degrade to rule path's own result, confidence=0.15, notes flag
 ```
 
 ## Confidence 
@@ -103,7 +94,7 @@ cd y2_ai_search_api && uv run python ../scripts/loadtest.py --requests 200 --con
 |---|---|
 | Cache hit | p95 ~55ms |
 | Rules | p95 ~41ms |
-| LLM fallback (Tier 1, uncontended) | avg ~2.6s — misses the 600ms target |
+| LLM fallback (uncontended) | avg ~2.6s — misses the 600ms target |
 | Zero-signal classify + Tier 1 + confidence cross-check | ~6.0s (live example, `docs/examples.md` #9) |
 
 Root cause of the 600ms miss: Structured Outputs strict mode forces every
@@ -115,11 +106,10 @@ correctness grounds). Full diagnosis and every number: [`docs/DESIGN.md`](docs/D
 
 ## Cost model
 
-Real measured tokens (Tier 1, `gpt-4.1-nano`): 3,323.5 avg prompt tokens,
-191.2 avg completion tokens per fallback call. **$0.000410/request**
-Tier-1-only, **~$0.000655/request** blended at a conservative 15% Tier-2
-rate. Even a conservative 20%-cache-hit scenario projects to ~$2,100/month
-at 10M queries. Full breakdown: [`docs/DESIGN.md`](docs/DESIGN.md).
+Real measured tokens (`gpt-4.1-nano`): 3,323.5 avg prompt tokens, 191.2 avg
+completion tokens per fallback call — **$0.000410/request**. Even a
+conservative 20%-cache-hit scenario projects to ~$2,100/month at 10M
+queries. Full breakdown: [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## Docs
 
