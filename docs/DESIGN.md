@@ -367,6 +367,23 @@ hand-guessed vocabulary this pass removed:
   injection/off-topic query has nothing real to embed-match against, so it
   reads as a semantic mismatch and gets capped below threshold anyway
   (`test_out_of_domain_query_embedding_mismatch_now_vetoes_below_threshold`).
+- **The embedding-similarity veto (`EMBEDDING_SIMILARITY_FLOOR`) can
+  under-score genuinely correct extractions.** A fully correct penthouse
+  listing (right city, property type, rooms, price, parking — every field
+  verified right) scored `embedding_similarity=0.4936` and was capped to
+  `confidence=0.4`, purely from the floor. Confirmed-correct extractions in
+  manual testing score anywhere from ~0.43 to ~0.56; the confirmed-bad case
+  that originally justified the floor scored ~0.42. These ranges overlap,
+  so no single global floor cleanly separates them with the data available.
+  Retuning this needs a broader labeled calibration set than exists right
+  now, and wasn't guessed at this close to submission.
+- **Two smaller, unconfirmed coverage gaps noticed in manual testing, not
+  investigated further.** Hebrew attached-prefix words immediately before
+  a taxonomy term (e.g. `"לדירת"`) may not reduce to the bare term the way
+  typo-correction already does — unconfirmed. Colloquial fractional
+  amounts (`"X וחצי"`) and the cue word `"מקסימום"` aren't recognized by
+  the price parser — confirmed absent, not investigated further. Both are
+  open questions for future work, not claimed as fixed.
 
 ## Confidence methodology
 
