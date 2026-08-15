@@ -19,7 +19,11 @@ _CATEGORY_DEFINITIONS: dict[Vertical, str] = {
 
 _EXTRACTION_EXAMPLES: dict[Vertical, str] = {
     Vertical.REAL_ESTATE: 'Example: "דירת 3 חדרים בירושלים עד מיליון שח" -> עיר=ירושלים, מס׳_חדרים=3, מחיר.max=1000000.',
-    Vertical.VEHICLES: 'Example: "טויוטה קורולה 2020 עד 70000 שח" -> יצרן=טויוטה, דגם=קורולה, שנה=2020, מחיר.max=70000.',
+    Vertical.VEHICLES: (
+        'Example: "טויוטה קורולה 2020 עד 70000 שח" -> יצרן=טויוטה, דגם=קורולה, שנה=2020, מחיר.max=70000.\n'
+        'Counter-example: "אופנוע, משהו יפני, עד 10000 שח" -- no brand is named '
+        '("Japanese" describes a region, not a manufacturer) -> יצרן is omitted, not guessed at.'
+    ),
     Vertical.USED_GOODS: 'Example: "אייפון 13 כחול כמו חדש עד 2500" -> צבע=כחול, מצב=כמו חדש, מחיר.max=2500.',
 }
 

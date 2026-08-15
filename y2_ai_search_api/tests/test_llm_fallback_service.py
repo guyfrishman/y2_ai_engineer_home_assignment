@@ -242,6 +242,28 @@ def test_strict_json_schema_has_no_optional_fields_and_forbids_extras():
             assert set(def_schema["required"]) == set(def_schema["properties"].keys())
 
 
+async def test_motorcycle_query_with_no_named_brand_never_gets_a_fabricated_manufacturer(monkeypatch):
+    # Regression for a manual-testing finding: a motorcycle query naming no
+    # brand at all, only "something Japanese", once got a fabricated Korean
+    # brand back from the LLM. יצרן is one taxonomy-wide brand enum (not
+    # scoped to motorcycle brands specifically), so a plausible-looking
+    # guess like "קיה"/"יונדאי" would pass schema validation even though
+    # it's wrong -- the extraction prompt now has an explicit counter-
+    # example for this case. This locks in the correct behavior when the
+    # model complies: no brand named in the source text -> יצרן omitted.
+    async def fake_chat(messages, model, response_format=None, logprobs=False, max_completion_tokens=None):
+        return _fake_response({"סוגי_רכב": ["אופנוע"]})
+
+    monkeypatch.setattr(llm_fallback_service.OpenAIRepository, "chat", staticmethod(fake_chat))
+
+    rule_path_params = taxonomy_repository.params_models[Vertical.VEHICLES]()
+    result = await llm_fallback_service.run_llm_fallback(
+        Vertical.VEHICLES, "אופנוע, משהו יפני, עד 10000 שח", rule_path_params
+    )
+
+    assert "יצרן" not in result.params.model_dump(exclude_none=True)
+
+
 async def test_category_classification_success_logs_the_chosen_vertical(monkeypatch):
     # Observability: for a routing call, "what did it decide" is the
     # headline fact -- it must be in the success log itself, not something
