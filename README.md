@@ -106,10 +106,15 @@ correctness grounds). Full diagnosis and every number: [`docs/DESIGN.md`](docs/D
 
 ## Cost model
 
-Real measured tokens (`gpt-4.1-nano`): 3,323.5 avg prompt tokens, 191.2 avg
-completion tokens per fallback call — **$0.000410/request**. Even a
-conservative 20%-cache-hit scenario projects to ~$2,100/month at 10M
-queries. Full breakdown: [`docs/DESIGN.md`](docs/DESIGN.md).
+| Metric | Value |
+|---|---|
+| Model | `gpt-4.1-nano` |
+| Avg prompt tokens / call | 3,323.5 |
+| Avg completion tokens / call | 191.2 |
+| Cost per request | $0.000410 |
+| Projected monthly (10M queries, 20% cache hit, conservative) | ~$1,300 |
+
+Full breakdown: [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## Docs
 
