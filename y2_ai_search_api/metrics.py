@@ -47,7 +47,6 @@ PARSE_COST_USD_TOTAL = Counter(
 # depends on — see docs/DESIGN.md.
 MODEL_PRICING_USD_PER_MILLION_TOKENS: dict[str, dict[str, float]] = {
     "gpt-4.1-nano": {"prompt": 0.10, "completion": 0.40},
-    "gpt-4o-mini": {"prompt": 0.15, "completion": 0.60},
     "text-embedding-3-small": {"prompt": 0.02, "completion": 0.0},
 }
 
